@@ -1,3 +1,5 @@
+**简体中文** | [English](README.en.md)
+
 # CTool 万能工具箱
 
 一个完全在浏览器本地运行的开发者工具箱 Chrome 扩展（Manifest V3）。无需账号，除可选的 AI 问答外无需联网，所有输入、转换与生成结果都只留在本机。
@@ -170,13 +172,17 @@
 
 ```text
 ctool/
+├── README.md              # 中文文档
+├── README.en.md           # 英文文档
 ├── manifest.json          # Manifest V3 配置
 ├── background.js          # 工具栏打开、标签复用、右键菜单、小窗分发与来源标签页
 ├── content.js             # 网页右下角悬浮图标与页面内小窗宿主
 ├── toolbox.html           # 统一页面：完整工具箱 + 紧凑小窗模式
+├── build-userscript.js    # 可选：从源码生成油猴单文件版
+├── ctool.user.js          # 生成物：自包含 UserScript（可上传到只收 .js 的平台）
 ├── assets/
 │   ├── sponsor-wechat.jpg  # 微信赞赏码（本地图片）
-│   └── sponsor-alipay.png  # 支付宝收款码（本地图片）
+│   └── sponsor-alipay.jpg  # 支付宝收款码（本地图片，实际为 JPEG 内容）
 ├── css/
 │   └── style.css          # 响应式明暗主题、下载面板与小窗模式样式
 ├── js/
@@ -202,13 +208,36 @@ ctool/
 
 ## 开发与打包
 
-项目没有构建步骤，修改源码后在扩展管理页点击“重新加载”即可。
+扩展本体没有构建步骤，修改源码后在扩展管理页点击“重新加载”即可。只有需要生成油猴单文件版时，才运行下面的可选构建命令。
 
 打包为 ZIP 时，让 `manifest.json` 位于压缩包根目录：
 
 ```powershell
 Compress-Archive -Path F:\ctf\ctool\* -DestinationPath F:\ctf\ctool.zip -Force
 ```
+
+### 油猴单文件版（ctool.user.js）
+
+部分平台只允许上传 `.js` 文件、无法提交扩展包。运行下面的命令，可从现有源码生成一份自包含的 UserScript：
+
+```bash
+node build-userscript.js
+```
+
+产物 `ctool.user.js`（约 1.3 MB）把 `toolbox.html`、`css/style.css`、16 个脚本与两张赞赏码全部内联（图片按文件魔数转 Data URL），零外部依赖、零网络请求，可直接安装到 Tampermonkey / Violentmonkey，或上传到只接受 `.js` 的脚本平台。源码改动后重新运行该命令即可刷新产物，**不要直接编辑生成的文件**。
+
+使用方式：页面右下角圆形 **C** 按钮、油猴菜单中的「打开 / 关闭 CTool 工具箱」，或快捷键 `Alt+Shift+C`。工具箱运行在隔离 iframe 中，不污染宿主页面样式；主题、语言、收藏、赞赏提示关闭状态等偏好通过 `GM_getValue` / `GM_setValue` 跨站点保存。
+
+与扩展版的差异：
+
+| 能力 | 油猴版 |
+| --- | --- |
+| 35 个工具 | 除「网页资源下载」外全部可用；该工具会显示不可用说明（依赖 `tabs` / `scripting` / `downloads` 扩展 API，连同 ZIP 打包一起不可用） |
+| 悬浮小窗、右键菜单 | 由悬浮按钮、菜单命令与快捷键替代 |
+| AI 问答 | 可用，但受目标接口的 CORS 策略限制 |
+| 每日赞赏提示 | 保留，状态跨站点同步 |
+
+iframe 使用 `srcdoc` 内联脚本。若目标站点设置了严格的 `Content-Security-Policy` 禁止内联脚本，工具箱会显示提示并允许在新标签页打开；这类站点建议改用完整版扩展。
 
 ## 说明
 

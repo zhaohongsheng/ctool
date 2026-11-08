@@ -9,7 +9,7 @@
   const DISMISSED_KEY = 'sponsorNoticeDismissed';
   const SPONSOR_TOOL_ID = 'sponsor';
   const WECHAT_QR = 'assets/sponsor-wechat.jpg';
-  const ALIPAY_QR = 'assets/sponsor-alipay.png';
+  const ALIPAY_QR = 'assets/sponsor-alipay.jpg';
 
   /* 用本地日历日期作为「今天」，避免 UTC 与本地时区跨日偏差。 */
   function todayKey() {
