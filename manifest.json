@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "CTool 万能工具箱",
+  "short_name": "万能工具箱",
+  "version": "1.4.0",
+  "description": "本地运行的万能开发者工具箱：37 个工具、中英文切换、职业推荐工作台、AI 问答、网页悬浮小窗与网页资源下载，所有数据仅在本机处理。",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "storage",
+    "contextMenus",
+    "tabs",
+    "clipboardWrite",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "toolbox.html"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "打开万能工具箱",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y"
+      },
+      "description": "打开万能工具箱"
+    }
+  }
+}
