@@ -558,7 +558,7 @@
     const nonAsciiRow = $('#uni-nonascii-row', root);
     const runButton = $('#uni-run', root);
 
-    setupTabs(root, (name) => {
+    const tabs = setupTabs(root, (name) => {
       mode = name;
       runButton.textContent = name === 'encode' ? T.t('编码') + ' ⌘↵' : T.t('解码') + ' ⌘↵';
       nonAsciiRow.style.display = name === 'encode' ? '' : 'none';
@@ -602,6 +602,7 @@
 
     if (context.text) {
       input.value = context.text;
+      if (context.action === 'encode' || context.action === 'decode') tabs.activate(context.action);
       run();
     }
   };
@@ -746,43 +747,89 @@
 
   T.renderers.imgbase64 = function renderImageBase64(root) {
     root.innerHTML = `
-      <div class="tool-grid tool-grid-wide">
-        <section class="card">
-          <div class="card-head">
-            <div class="card-heading"><span class="card-icon">IMG</span><h2>图片转 Base64</h2></div>
-            <div class="card-actions"><span class="badge" id="ib-badge">等待图片</span></div>
-          </div>
-          <div class="card-body">
-            <label class="file-drop" id="ib-drop">
-              <input type="file" id="ib-file" accept="image/*">
-              <strong>选择或拖入图片</strong>
-              <span>生成 Data URL，可直接用于 HTML、CSS 或 Markdown。</span>
-            </label>
-            <div class="image-preview-wrap" id="ib-preview-wrap" hidden>
-              <img id="ib-preview" alt="预览">
-            </div>
-            <div class="meta-line" id="ib-meta"></div>
-            <div class="status" id="ib-status"></div>
-          </div>
-        </section>
+      <div class="stack">
+        <div class="mode-switch" role="tablist">
+          <button class="mode-btn active" type="button" data-mode="encode" role="tab" aria-selected="true">图片 → Base64</button>
+          <button class="mode-btn" type="button" data-mode="decode" role="tab" aria-selected="false">Base64 → 图片</button>
+        </div>
 
-        <section class="card">
-          <div class="card-head">
-            <div class="card-heading"><span class="card-icon">64</span><h2>${T.t('Base64 结果')}</h2></div>
-            <div class="card-actions">
-              <button class="btn btn-sm" type="button" data-copy="ib-output">复制</button>
-              <button class="btn btn-sm" type="button" id="ib-download">下载</button>
-            </div>
+        <div id="ib-pane-encode">
+          <div class="tool-grid tool-grid-wide">
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">IMG</span><h2>图片转 Base64</h2></div>
+                <div class="card-actions"><span class="badge" id="ib-badge">等待图片</span></div>
+              </div>
+              <div class="card-body">
+                <label class="file-drop" id="ib-drop">
+                  <input type="file" id="ib-file" accept="image/*">
+                  <strong>选择或拖入图片</strong>
+                  <span>生成 Data URL，可直接用于 HTML、CSS 或 Markdown。</span>
+                </label>
+                <div class="image-preview-wrap" id="ib-preview-wrap" hidden>
+                  <img id="ib-preview" alt="预览">
+                </div>
+                <div class="meta-line" id="ib-meta"></div>
+                <div class="status" id="ib-status"></div>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">64</span><h2>${T.t('Base64 结果')}</h2></div>
+                <div class="card-actions">
+                  <button class="btn btn-sm" type="button" data-copy="ib-output">复制</button>
+                  <button class="btn btn-sm" type="button" id="ib-download">下载</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="tabs" role="tablist">
+                  <button class="tab active" type="button" data-tab="dataurl" role="tab" aria-selected="true">Data URL</button>
+                  <button class="tab" type="button" data-tab="css" role="tab" aria-selected="false">CSS</button>
+                  <button class="tab" type="button" data-tab="html" role="tab" aria-selected="false">HTML</button>
+                </div>
+                <textarea id="ib-output" class="code-area output-area" readonly spellcheck="false" placeholder="选择图片后显示 Base64 结果"></textarea>
+              </div>
+            </section>
           </div>
-          <div class="card-body">
-            <div class="tabs" role="tablist">
-              <button class="tab active" type="button" data-tab="dataurl" role="tab" aria-selected="true">Data URL</button>
-              <button class="tab" type="button" data-tab="css" role="tab" aria-selected="false">CSS</button>
-              <button class="tab" type="button" data-tab="html" role="tab" aria-selected="false">HTML</button>
-            </div>
-            <textarea id="ib-output" class="code-area output-area" readonly spellcheck="false" placeholder="选择图片后显示 Base64 结果"></textarea>
+        </div>
+
+        <div id="ib-pane-decode" hidden>
+          <div class="tool-grid tool-grid-wide">
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">64</span><h2>Base64 / Data URL</h2></div>
+                <div class="card-actions">
+                  <button class="btn btn-sm" type="button" id="ibd-open">从文件读取</button>
+                  <input type="file" id="ibd-file" accept=".txt,.b64,text/plain" hidden>
+                </div>
+              </div>
+              <div class="card-body">
+                <textarea id="ibd-input" class="code-area output-area" spellcheck="false" placeholder="粘贴 Base64 字符串，或完整的 data:image/png;base64,…"></textarea>
+                <div class="row-between">
+                  <span class="field-hint">支持纯 Base64（自动识别格式）与完整 Data URL。</span>
+                  <span class="status" id="ibd-status"></span>
+                </div>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-primary" type="button" id="ibd-run">还原图片</button>
+                <button class="btn" type="button" id="ibd-download" disabled>下载图片</button>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">IMG</span><h2>图片预览</h2></div>
+              </div>
+              <div class="card-body">
+                <div class="image-preview-wrap" id="ibd-preview-wrap" hidden>
+                  <img id="ibd-preview" alt="还原结果">
+                </div>
+                <div class="meta-line" id="ibd-meta"></div>
+              </div>
+            </section>
           </div>
-        </section>
+        </div>
       </div>
     `;
 
@@ -869,6 +916,127 @@
       downloadText(base + '.base64.txt', output.value, 'text/plain;charset=utf-8');
     });
     bindCopyButtons(root);
+
+    /* Base64 → 图片：从魔数推断格式，全程本地处理 */
+    const ibdInput = $('#ibd-input', root);
+    const ibdStatus = $('#ibd-status', root);
+    const ibdMeta = $('#ibd-meta', root);
+    const ibdPreviewWrap = $('#ibd-preview-wrap', root);
+    const ibdPreview = $('#ibd-preview', root);
+    const ibdDownload = $('#ibd-download', root);
+    const ibdOpen = $('#ibd-open', root);
+    const ibdFile = $('#ibd-file', root);
+    let ibdObjectUrl = '';
+    let ibdExtension = 'png';
+
+    function guessImageMime(bytes) {
+      const head = (start, length) => String.fromCharCode.apply(null, bytes.subarray(start, start + length));
+      if (bytes.length >= 4 && bytes[0] === 0x89 && head(1, 3) === 'PNG') return 'image/png';
+      if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+      if (bytes.length >= 4 && head(0, 4) === 'GIF8') return 'image/gif';
+      if (bytes.length >= 12 && head(0, 4) === 'RIFF' && head(8, 4) === 'WEBP') return 'image/webp';
+      if (bytes.length >= 2 && head(0, 2) === 'BM') return 'image/bmp';
+      if (bytes.length >= 4 && bytes[0] === 0x3c) return 'image/svg+xml';
+      if (bytes.length >= 4 && (head(0, 3) === 'II*' || (bytes[0] === 0x4d && bytes[1] === 0x4d && bytes[2] === 0x00))) return 'image/tiff';
+      return '';
+    }
+
+    function extensionForMime(mime) {
+      const map = {
+        'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp',
+        'image/bmp': 'bmp', 'image/svg+xml': 'svg', 'image/x-icon': 'ico',
+        'image/tiff': 'tiff', 'image/avif': 'avif'
+      };
+      return map[mime] || (mime.split('/')[1] || 'png').replace('+xml', '');
+    }
+
+    function restoreImage() {
+      const raw = ibdInput.value.trim();
+      if (!raw) {
+        setStatus(ibdStatus, T.t('请输入 Base64 内容'), 'warn');
+        return;
+      }
+      let base64 = raw;
+      let mime = '';
+      const match = raw.match(/^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/i);
+      if (match) {
+        mime = match[1].toLowerCase();
+        base64 = match[2];
+      } else {
+        base64 = raw.replace(/\s+/g, '');
+      }
+      let bytes = null;
+      try {
+        bytes = T.base64ToBytes(base64);
+      } catch (_) {
+        bytes = null;
+      }
+      if (!bytes || !bytes.length) {
+        setStatus(ibdStatus, T.t('Base64 内容无效'), 'error');
+        return;
+      }
+      if (!mime) mime = guessImageMime(bytes);
+      if (!mime) {
+        setStatus(ibdStatus, T.t('无法识别图片格式，请使用完整的 Data URL'), 'error');
+        return;
+      }
+      const blob = new Blob([bytes], { type: mime });
+      if (ibdObjectUrl) URL.revokeObjectURL(ibdObjectUrl);
+      ibdObjectUrl = URL.createObjectURL(blob);
+      ibdExtension = extensionForMime(mime);
+      ibdPreview.onload = () => {
+        ibdPreviewWrap.hidden = false;
+        ibdMeta.textContent = mime + ' · ' + ibdPreview.naturalWidth + ' × ' + ibdPreview.naturalHeight + ' px · ' + formatBytes(bytes.length);
+        setStatus(ibdStatus, '✓ ' + T.t('还原成功'), 'ok');
+      };
+      ibdPreview.onerror = () => {
+        ibdPreviewWrap.hidden = true;
+        setStatus(ibdStatus, T.t('图片数据无法预览，请检查内容或格式'), 'error');
+      };
+      ibdPreview.src = ibdObjectUrl;
+      ibdDownload.disabled = false;
+    }
+
+    ibdOpen.addEventListener('click', () => ibdFile.click());
+    ibdFile.addEventListener('change', () => {
+      const file = ibdFile.files && ibdFile.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        ibdInput.value = String(reader.result || '');
+        restoreImage();
+      };
+      reader.readAsText(file);
+    });
+    $('#ibd-run', root).addEventListener('click', restoreImage);
+    ibdDownload.addEventListener('click', () => {
+      if (!ibdObjectUrl) return;
+      const anchor = document.createElement('a');
+      anchor.href = ibdObjectUrl;
+      anchor.download = 'ctool-image.' + ibdExtension;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      showToast(T.t('文件已开始下载'));
+    });
+    bindCtrlEnter(ibdInput, restoreImage);
+
+    $$('.mode-btn', root).forEach((button) => {
+      button.addEventListener('click', () => {
+        const mode = button.getAttribute('data-mode');
+        $$('.mode-btn', root).forEach((item) => {
+          const active = item === button;
+          item.classList.toggle('active', active);
+          item.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        $('#ib-pane-encode', root).hidden = mode !== 'encode';
+        $('#ib-pane-decode', root).hidden = mode !== 'decode';
+      });
+    });
+
+    return function cleanup() {
+      if (ibdObjectUrl) URL.revokeObjectURL(ibdObjectUrl);
+    };
   };
 
   /* ==========================================================================

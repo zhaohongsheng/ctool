@@ -3,7 +3,7 @@
   "name": "CTool 万能工具箱",
   "short_name": "万能工具箱",
   "version": "1.4.0",
-  "description": "本地运行的万能开发者工具箱：37 个工具、中英文切换、职业推荐工作台、AI 问答、网页悬浮小窗与网页资源下载，所有数据仅在本机处理。",
+  "description": "本地运行的万能开发者工具箱：35 个工具、中英文切换、职业推荐工作台、AI 问答、网页悬浮小窗与网页资源下载，所有数据仅在本机处理。",
   "minimum_chrome_version": "111",
   "permissions": [
     "storage",
@@ -31,7 +31,8 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "toolbox.html"
+        "toolbox.html",
+        "assets/*"
       ],
       "matches": [
         "<all_urls>"

@@ -1,23 +1,18 @@
-/* CTool - 网页图片 / 文档 / 表格 / 媒体下载 */
+/* CTool - 网页资源下载（合并图片/文档/表格/媒体，按类型分类复选框批量下载） */
 (function () {
   'use strict';
 
   const T = window.CTool;
   const { $, $$, escapeHtml, showToast, copyText, setStatus } = T;
 
-  const DEFAULT_FOLDERS = {
-    images: 'CTool/图片',
-    docs: 'CTool/文档',
-    tables: 'CTool/表格',
-    media: 'CTool/媒体'
-  };
+  const DEFAULT_FOLDER = 'CTool/下载';
 
   /* ==========================================================================
      页面扫描函数
      该函数会被注入到目标网页执行，不能引用本文件外部的任何变量。
      ========================================================================== */
 
-  function scanPageResources(kind) {
+  function scanAllResources() {
     const MAX_IMAGES = 400;
     const MAX_DOCS = 600;
     const MAX_MEDIA = 300;
@@ -143,11 +138,16 @@
       return 'other';
     }
 
+    const allItems = [];
+
+    function addItem(type, item) {
+      allItems.push(Object.assign({ type: type }, item));
+    }
+
     /* ---------------------------- 图片 ---------------------------- */
 
     function scanImages() {
       const seen = new Set();
-      const items = [];
 
       function addImage(raw, meta) {
         const url = absolute(raw, true);
@@ -156,9 +156,9 @@
         seen.add(url);
         const ext = extOf(url) || 'img';
         const info = meta || {};
-        items.push({
+        addItem('image', {
           url: url,
-          name: cleanText(info.name || filenameOf(url) || ('image-' + (items.length + 1) + '.' + ext), 110),
+          name: cleanText(info.name || filenameOf(url) || ('image-' + (allItems.filter((i) => i.type === 'image').length + 1) + '.' + ext), 110),
           alt: cleanText(info.alt, 160),
           width: Math.max(0, Math.round(info.width || 0)),
           height: Math.max(0, Math.round(info.height || 0)),
@@ -236,27 +236,18 @@
           // 跨域画布无法导出。
         }
       });
-
-      return {
-        kind: 'images',
-        page: page,
-        items: items.slice(0, MAX_IMAGES),
-        totalFound: items.length,
-        truncated: items.length > MAX_IMAGES
-      };
     }
 
     /* ---------------------------- 文档 ---------------------------- */
 
     function scanDocs() {
       const seen = new Set();
-      const items = [];
 
       function addDoc(raw, label, options) {
         const opts = options || {};
         const url = absolute(raw, false);
         if (!url || seen.has(url)) return;
-        let ext = docExtOf(url);
+        let ext = opts.ext || docExtOf(url);
         if (!ext && opts.labelExt) ext = opts.labelExt;
         const forced = !!opts.force;
         if (!ext && !forced) return;
@@ -265,42 +256,173 @@
         if (ext && !DOC_EXTS.has(ext) && !forced) return;
         if (!ext) ext = 'file';
         seen.add(url);
-        items.push({
+        let baseName = filenameOf(url);
+        if (baseName && !/\.[a-z0-9]{1,8}$/i.test(baseName)) {
+          const labelName = cleanText(label, 80).replace(/[\\/:*?"<>|]/g, '_');
+          if (labelName) baseName = labelName + (ext && ext !== 'file' ? '.' + ext : '');
+        }
+        addItem('doc', {
           url: url,
-          name: cleanText(filenameOf(url) || ('file-' + (items.length + 1) + (ext && ext !== 'file' ? '.' + ext : '')), 110),
-          label: cleanText(label || filenameOf(url) || url, 160),
+          name: cleanText(opts.name || baseName || ('file-' + (allItems.filter((i) => i.type === 'doc').length + 1) + (ext && ext !== 'file' ? '.' + ext : '')), 110),
+          label: cleanText(label || opts.name || filenameOf(url) || url, 160),
           ext: ext,
-          type: classifyDoc(ext),
+          docType: classifyDoc(ext),
           source: opts.source || 'link'
         });
+      }
+
+      const DOC_TEXT_KEYWORDS = ['文库', '文档', '附件', '资料', '下载', '手册', '报告', '论文', '简历', '合同', '协议', '模板', '说明书', '白皮书', '规范', '教材', '课件', '试卷', 'pdf', 'word', 'excel', 'ppt', 'txt', 'epub', 'wps'];
+      const DOC_URL_KEYWORDS = ['wenku', 'download', 'attachment', 'getfile', 'filedown', '/file/', '/files/', '/doc/', '/docs/', '/document/', '/view/doc', '/download/', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.zip', '.rar', '.7z', '.epub', '.csv', '.md'];
+      const DOC_NOISE = /(客户端|浏览器|插件|扩展|应用商店|下载\s*app|app\s*下载|驱动|安装包)/i;
+
+      function isDocLikeUrl(url, label, element) {
+        if (DOC_NOISE.test(label || '') || DOC_NOISE.test(url || '')) return false;
+        const u = (url || '').toLowerCase();
+        const l = (label || '').toLowerCase();
+        if (DOC_TEXT_KEYWORDS.some((k) => l.includes(k))) return true;
+        if (DOC_URL_KEYWORDS.some((k) => u.includes(k))) return true;
+        if (element) {
+          const marker = [
+            element.className,
+            element.id,
+            element.getAttribute('aria-label'),
+            element.getAttribute('data-type'),
+            element.getAttribute('data-action')
+          ].filter(Boolean).join(' ').toLowerCase();
+          if (DOC_TEXT_KEYWORDS.some((k) => marker.includes(k))) return true;
+        }
+        return false;
       }
 
       Array.from(document.querySelectorAll('a[href], area[href]')).forEach((anchor) => {
         const rawHref = anchor.getAttribute('href') || '';
         if (!rawHref || rawHref.charAt(0) === '#') return;
         const label = anchor.getAttribute('title') || anchor.textContent || '';
-        const labelExt = docExtOf(label);
-        const force = anchor.hasAttribute('download');
+        const hasDownloadAttr = anchor.hasAttribute('download');
+        if (!hasDownloadAttr && !isDocLikeUrl(anchor.href, label, anchor)) return;
         addDoc(anchor.href, label, {
-          force: force,
-          labelExt: labelExt,
-          source: force ? 'download' : 'link'
+          force: true,
+          labelExt: docExtOf(label),
+          source: hasDownloadAttr ? 'download' : 'link'
         });
       });
 
       Array.from(document.querySelectorAll('iframe[src], embed[src], object[data]')).forEach((element) => {
         const raw = element.getAttribute('src') || element.getAttribute('data');
-        addDoc(raw, element.getAttribute('title') || '页面嵌入文件', {
+        const label = element.getAttribute('title') || element.getAttribute('aria-label') || '';
+        if (!isDocLikeUrl(raw, label, element)) return;
+        addDoc(raw, label || '页面嵌入文件', {
           source: 'embed',
           force: true
         });
       });
 
-      const citation = document.querySelector('meta[name="citation_pdf_url"]');
-      if (citation) {
-        addDoc(citation.getAttribute('content'), document.title || 'PDF 全文', {
+      document.querySelectorAll('meta[name="citation_pdf_url"], meta[name="download"], meta[property="og:document"], meta[property="og:pdf"]').forEach((meta) => {
+        const content = meta.getAttribute('content') || '';
+        if (!content) return;
+        addDoc(content, document.title || 'PDF 全文', {
           source: 'meta',
           force: true
+        });
+      });
+
+      document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
+        let raw = null;
+        try {
+          raw = JSON.parse(script.textContent || 'null');
+        } catch (_) {
+          return;
+        }
+        const nodes = [];
+        const visit = (value) => {
+          if (!value) return;
+          if (Array.isArray(value)) {
+            value.forEach(visit);
+            return;
+          }
+          if (typeof value === 'string') {
+            const ext = docExtOf(value);
+            if (ext && DOC_EXTS.has(ext)) nodes.push({ url: value, name: '' });
+            return;
+          }
+          if (typeof value !== 'object') return;
+          if (value['@graph']) visit(value['@graph']);
+          if (value.mainEntity) visit(value.mainEntity);
+          if (value.itemListElement) visit(value.itemListElement);
+          const name = value.name || value.headline || value.title || '';
+          const candidates = [].concat(value.contentUrl || [], value.url || [], value.encoding || [], value.associatedMedia || []);
+          candidates.forEach((candidate) => {
+            const target = candidate && typeof candidate === 'object'
+              ? (candidate.contentUrl || candidate.url || candidate.embedUrl || '')
+              : candidate;
+            if (typeof target !== 'string' || !target) return;
+            const ext = docExtOf(target);
+            if (!ext || !DOC_EXTS.has(ext)) return;
+            nodes.push({ url: target, name: name });
+          });
+        };
+        visit(raw);
+        nodes.forEach((node) => {
+          addDoc(node.url, node.name || document.title || '页面文档', {
+            source: 'json-ld',
+            force: true
+          });
+        });
+      });
+
+      document.querySelectorAll('link[rel="alternate"], link[type*="pdf"], link[type*="document"], link[type*="msword"], link[type*="officedocument"]').forEach((link) => {
+        const href = link.getAttribute('href') || '';
+        if (!href) return;
+        const type = (link.getAttribute('type') || '').toLowerCase();
+        if (!/pdf|document|msword|officedocument/.test(type) && !isDocLikeUrl(href, link.getAttribute('title') || '')) return;
+        addDoc(href, link.getAttribute('title') || document.title || '文档链接', {
+          source: 'link',
+          force: true
+        });
+      });
+
+      // 下载按钮上的文档地址（data-* 属性）
+      document.querySelectorAll('[data-download], [data-download-url], [data-file], [data-file-url], [data-url], [data-href]').forEach((element) => {
+        const raw = element.getAttribute('data-download-url') || element.getAttribute('data-download') ||
+          element.getAttribute('data-file-url') || element.getAttribute('data-file') ||
+          element.getAttribute('data-url') || element.getAttribute('data-href') || '';
+        if (!raw || raw.charAt(0) === '#') return;
+        const label = element.getAttribute('title') || element.getAttribute('aria-label') || element.textContent || '';
+        const explicit = element.hasAttribute('data-download') || element.hasAttribute('data-download-url') || element.hasAttribute('data-file') || element.hasAttribute('data-file-url');
+        if (!explicit && !isDocLikeUrl(raw, label, element)) return;
+        addDoc(raw, label, {
+          source: 'data-attr',
+          force: true
+        });
+      });
+
+      // 已经通过网络请求加载过的文档资源
+      try {
+        performance.getEntriesByType('resource').forEach((entry) => {
+          if (!entry || !entry.name) return;
+          const ext = extOf(entry.name);
+          if (!ext || !DOC_EXTS.has(ext)) return;
+          addDoc(entry.name, filenameOf(entry.name), {
+            source: 'network'
+          });
+        });
+      } catch (_) {
+        // 忽略性能接口错误。
+      }
+
+      // 常见文档站点：至少把当前文档页作为一项，避免整页扫不到内容
+      const host = String(location.hostname || '').toLowerCase();
+      const docHosts = [
+        'wenku.baidu.com', 'doc88.com', 'docin.com', 'book118.com', '360doc.com',
+        'renrendoc.com', 'taodocs.com', 'docs.google.com', 'drive.google.com',
+        'docs.qq.com', 'kdocs.cn', 'yuque.com', 'feishu.cn', 'notion.site'
+      ];
+      if (docHosts.some((site) => host === site || host.endsWith('.' + site))) {
+        addDoc(location.href, document.title || host, {
+          source: 'page',
+          force: true,
+          ext: 'html',
+          name: cleanText(document.title || host, 100) + '.html'
         });
       }
 
@@ -311,21 +433,12 @@
           force: true
         });
       }
-
-      return {
-        kind: 'docs',
-        page: page,
-        items: items.slice(0, MAX_DOCS),
-        totalFound: items.length,
-        truncated: items.length > MAX_DOCS
-      };
     }
 
     /* ---------------------------- 媒体 ---------------------------- */
 
     function scanMedia() {
       const seen = new Set();
-      const items = [];
 
       function addMedia(raw, meta) {
         const info = meta || {};
@@ -338,9 +451,9 @@
         if (!MEDIA_EXTS.has(ext)) return;
         seen.add(url);
         const mediaType = info.mediaType || (AUDIO_EXTS.has(ext) ? 'audio' : 'video');
-        items.push({
+        addItem('media', {
           url: url,
-          name: cleanText(info.name || filenameOf(url) || ('media-' + (items.length + 1) + '.' + ext), 110),
+          name: cleanText(info.name || filenameOf(url) || ('media-' + (allItems.filter((i) => i.type === 'media').length + 1) + '.' + ext), 110),
           label: cleanText(info.label || filenameOf(url) || url, 160),
           ext: ext,
           mediaType: mediaType,
@@ -352,15 +465,34 @@
 
       Array.from(document.querySelectorAll('video, audio')).forEach((element) => {
         const tag = element.tagName.toLowerCase();
-        const src = element.currentSrc || element.getAttribute('src') || '';
-        addMedia(src, {
-          label: element.getAttribute('title') || element.getAttribute('aria-label') || (tag === 'video' ? '页面视频' : '页面音频'),
-          mediaType: tag === 'audio' ? 'audio' : 'video',
-          duration: element.duration,
-          source: tag
-        });
-        Array.from(element.querySelectorAll('source[src]')).forEach((source) => {
-          addMedia(source.getAttribute('src'), {
+        const src = element.currentSrc || element.getAttribute('src') || element.getAttribute('data-src') || '';
+        const poster = element.getAttribute('poster') || '';
+        if (src) {
+          addMedia(src, {
+            label: element.getAttribute('title') || element.getAttribute('aria-label') || (tag === 'video' ? '页面视频' : '页面音频'),
+            mediaType: tag === 'audio' ? 'audio' : 'video',
+            duration: element.duration,
+            source: tag
+          });
+        }
+        if (poster) {
+          const posterUrl = absolute(poster, true);
+          const alreadyAdded = posterUrl && allItems.some((item) => item.type === 'image' && item.url === posterUrl);
+          if (posterUrl && !alreadyAdded) {
+            addItem('image', {
+              url: posterUrl,
+              name: cleanText(filenameOf(poster) || ('poster-' + Date.now()) + '.jpg', 110),
+              alt: '视频封面',
+              width: element.videoWidth || element.clientWidth,
+              height: element.videoHeight || element.clientHeight,
+              ext: extOf(poster) || 'jpg',
+              source: 'poster'
+            });
+          }
+        }
+        Array.from(element.querySelectorAll('source[src], source[data-src]')).forEach((source) => {
+          const s = source.getAttribute('src') || source.getAttribute('data-src') || '';
+          addMedia(s, {
             label: element.getAttribute('title') || (tag === 'video' ? '视频源' : '音频源'),
             mediaType: tag === 'audio' ? 'audio' : 'video',
             source: 'source'
@@ -369,28 +501,44 @@
       });
 
       Array.from(document.querySelectorAll('a[href]')).forEach((anchor) => {
-        const ext = extOf(anchor.href);
-        if (!MEDIA_EXTS.has(ext)) return;
-        addMedia(anchor.href, {
+        const href = anchor.href;
+        const ext = extOf(href);
+        const isMediaExt = MEDIA_EXTS.has(ext);
+        const isMediaUrl = !isMediaExt && /(video|media|mp4|flv|m3u8|mpd|mov|avi|wmv|webm)/i.test(href);
+        if (!isMediaExt && !isMediaUrl) return;
+        addMedia(href, {
           label: anchor.getAttribute('title') || anchor.textContent || '',
           mediaType: AUDIO_EXTS.has(ext) ? 'audio' : 'video',
           source: 'link'
         });
       });
 
-      return {
-        kind: 'media',
-        page: page,
-        items: items.slice(0, MAX_MEDIA),
-        totalFound: items.length,
-        truncated: items.length > MAX_MEDIA
-      };
+      // 检查带有 data-src 或 data-video 属性的元素（懒加载视频）
+      document.querySelectorAll('[data-src]').forEach((el) => {
+        const src = el.getAttribute('data-src') || '';
+        if (!src || MEDIA_EXTS.has(extOf(src))) return;
+        addMedia(src, {
+          label: el.getAttribute('title') || el.getAttribute('alt') || '懒加载媒体',
+          mediaType: VIDEO_EXTS.has(extOf(src)) ? 'video' : 'audio',
+          source: 'data-src'
+        });
+      });
+
+      // 检查 video 音轨
+      document.querySelectorAll('track[kind="captions"], track[kind="subtitles"]').forEach((track) => {
+        const src = track.getAttribute('src') || '';
+        if (!src) return;
+        addMedia(src, {
+          label: track.getAttribute('label') || '字幕文件',
+          mediaType: 'audio',
+          source: 'track'
+        });
+      });
     }
 
     /* ---------------------------- 表格 ---------------------------- */
 
     function scanTables() {
-      const items = [];
       const allTables = Array.from(document.querySelectorAll('table'));
       let totalFound = 0;
 
@@ -496,52 +644,163 @@
         return { csv: output, truncated: truncated };
       }
 
+      const seenMatrixKeys = new Set();
+      const usedTitles = new Set();
+      let tableIndex = 0;
+
+      function matrixKey(matrix) {
+        return matrix.map((row) => row.join('\u0001')).join('\u0002').slice(0, 4000);
+      }
+
+      function pushTable(matrix, title, hasHeader, options) {
+        const opts = options || {};
+        if (!matrix || !matrix.length) return false;
+        if (matrix.length < (opts.minRows || 1)) return false;
+        const hasContent = matrix.some((row) => row.some((cell) => cell !== ''));
+        if (!hasContent) return false;
+        const key = opts.dedupeKey || matrixKey(matrix);
+        if (seenMatrixKeys.has(key)) return false;
+        seenMatrixKeys.add(key);
+        tableIndex += 1;
+        const csvInfo = toCsv(matrix);
+        const columns = matrix.reduce((max, row) => Math.max(max, row.length), 0);
+        totalFound += 1;
+        let finalTitle = cleanText(title || ('表格 ' + tableIndex), 120);
+        if (usedTitles.has(finalTitle)) {
+          let suffix = 2;
+          while (usedTitles.has(finalTitle + ' (' + suffix + ')')) suffix += 1;
+          finalTitle = finalTitle + ' (' + suffix + ')';
+        }
+        usedTitles.add(finalTitle);
+        addItem('table', {
+          name: cleanText(finalTitle.replace(/[\\/:*?"<>|]/g, '_'), 80) + '.csv',
+          title: finalTitle,
+          rows: matrix.length,
+          cols: columns,
+          hasHeader: !!hasHeader,
+          truncated: !!opts.truncated || csvInfo.truncated,
+          preview: matrix.slice(0, MAX_PREVIEW_ROWS).map((row) => row.slice(0, MAX_PREVIEW_COLS)),
+          previewCols: Math.min(columns, MAX_PREVIEW_COLS),
+          csv: csvInfo.csv
+        });
+        return true;
+      }
+
       allTables.forEach((table) => {
         if (table.parentElement && table.parentElement.closest('table')) return;
         if (table.getAttribute('role') === 'presentation') return;
         if (!table.rows.length) return;
         const matrixInfo = buildMatrix(table);
-        if (!matrixInfo.matrix.length) return;
-        const hasContent = matrixInfo.matrix.some((row) => row.some((cell) => cell !== ''));
-        if (!hasContent) return;
-
-        totalFound += 1;
-        if (items.length >= MAX_TABLES) return;
-
-        const csvInfo = toCsv(matrixInfo.matrix);
-        const columns = matrixInfo.matrix.reduce((max, row) => Math.max(max, row.length), 0);
         const firstRow = table.rows[0];
         const hasHeader = !!table.tHead ||
           (firstRow && Array.from(firstRow.cells).length > 0 && Array.from(firstRow.cells).every((cell) => cell.tagName === 'TH'));
-        const title = tableTitle(table, items.length);
-
-        items.push({
-          name: cleanText(title.replace(/[\\/:*?"<>|]/g, '_'), 80) + '.csv',
-          title: title,
-          rows: matrixInfo.matrix.length,
-          cols: columns,
-          hasHeader: hasHeader,
-          truncated: matrixInfo.truncated || csvInfo.truncated,
-          preview: matrixInfo.matrix.slice(0, MAX_PREVIEW_ROWS).map((row) => row.slice(0, MAX_PREVIEW_COLS)),
-          previewCols: Math.min(columns, MAX_PREVIEW_COLS),
-          csv: csvInfo.csv
+        pushTable(matrixInfo.matrix, tableTitle(table, tableIndex + 1), hasHeader, {
+          truncated: matrixInfo.truncated
         });
       });
 
-      return {
-        kind: 'tables',
-        page: page,
-        items: items,
-        totalFound: totalFound,
-        truncated: totalFound > items.length || items.some((item) => item.truncated)
-      };
+      /* 将页面列表元素（ul/ol/dl）转换为表格 */
+      function textsToRows(texts) {
+        if (texts.length < 2) return [];
+        const separators = ['\t', ' | ', ' — ', ' - ', '：', ':'];
+        for (let i = 0; i < separators.length; i += 1) {
+          const sep = separators[i];
+          const split = texts.map((text) => text.split(sep).map((part) => part.trim()));
+          const width = split[0].length;
+          if (width >= 2 && width <= 12 && split.every((row) => row.length === width && row.every((cell) => cell !== ''))) {
+            return split;
+          }
+        }
+        return texts.map((text) => [text]);
+      }
+
+      function listTextRows(list) {
+        const items = Array.from(list.children).filter((li) => li.tagName === 'LI');
+        const texts = items.map((li) => cleanText(li.textContent, 500)).filter((text) => !!text);
+        return textsToRows(texts);
+      }
+
+      function isNavList(element) {
+        if (!element.closest) return false;
+        return !!element.closest(
+          'nav, header, footer, [role="navigation"], [role="menu"], [role="menubar"], ' +
+          '[class*="breadcrumb"], [class*="pagination"], [class*="pager"], [class*="navbar"], ' +
+          '[class*="sidebar"], [class*="tabbar"], [class*="nav-list"], [id*="breadcrumb"]'
+        );
+      }
+
+      document.querySelectorAll('ul, ol').forEach((list) => {
+        if (isNavList(list)) return;
+        const matrix = listTextRows(list);
+        if (!matrix.length) return;
+        const explicit = list.getAttribute('aria-label') || list.getAttribute('data-title') || list.getAttribute('title') || '';
+        const heading = nearestHeading(list) || '';
+        const previewText = cleanText(matrix[0].join(' / '), 40);
+        const title = cleanText(
+          explicit || (heading ? heading + ' · ' + previewText : previewText || ('列表 ' + (tableIndex + 1))), 100
+        );
+        pushTable(matrix, title, false, { minRows: 2 });
+      });
+
+      // 虚拟列表 / ARIA 列表（div role="list"）
+      document.querySelectorAll('[role="list"]').forEach((list) => {
+        if (list.tagName === 'UL' || list.tagName === 'OL') return;
+        if (isNavList(list)) return;
+        const items = Array.from(list.children).filter((el) => el.getAttribute('role') === 'listitem');
+        const matrix = textsToRows(items.map((el) => cleanText(el.textContent, 500)).filter((text) => !!text));
+        if (!matrix.length) return;
+        const explicit = list.getAttribute('aria-label') || list.getAttribute('data-title') || '';
+        const heading = nearestHeading(list) || '';
+        const previewText = cleanText(matrix[0].join(' / '), 40);
+        const title = cleanText(
+          explicit || (heading ? heading + ' · ' + previewText : previewText || ('列表 ' + (tableIndex + 1))), 100
+        );
+        pushTable(matrix, title, false, { minRows: 2 });
+      });
+
+      document.querySelectorAll('dl').forEach((dl) => {
+        if (isNavList(dl)) return;
+        const dts = Array.from(dl.children).filter((el) => el.tagName === 'DT');
+        const dds = Array.from(dl.children).filter((el) => el.tagName === 'DD');
+        const matrix = [];
+        const rows = Math.max(dts.length, dds.length);
+        for (let i = 0; i < rows; i += 1) {
+          matrix.push([
+            dts[i] ? cleanText(dts[i].textContent, 500) : '',
+            dds[i] ? cleanText(dds[i].textContent, 500) : ''
+          ]);
+        }
+        if (!matrix.length) return;
+        const explicit = dl.getAttribute('aria-label') || dl.getAttribute('data-title') || dl.getAttribute('title') || '';
+        const heading = nearestHeading(dl) || '';
+        const previewText = cleanText(matrix[0].join(' / '), 40);
+        const title = cleanText(
+          explicit || (heading ? heading + ' · ' + previewText : previewText || ('定义列表 ' + (tableIndex + 1))), 100
+        );
+        pushTable(matrix, title, false, { minRows: 2 });
+      });
+
+      return { totalFound: totalFound };
     }
 
-    if (kind === 'images') return scanImages();
-    if (kind === 'docs') return scanDocs();
-    if (kind === 'media') return scanMedia();
-    if (kind === 'tables') return scanTables();
-    throw new Error('未知的扫描类型：' + kind);
+    /* 执行所有扫描 */
+    scanImages();
+    scanDocs();
+    scanMedia();
+    scanTables();
+
+    const images = allItems.filter((i) => i.type === 'image').length;
+    const docs = allItems.filter((i) => i.type === 'doc').length;
+    const media = allItems.filter((i) => i.type === 'media').length;
+    const tables = allItems.filter((i) => i.type === 'table').length;
+    return {
+      kind: 'all',
+      page: page,
+      items: allItems,
+      counts: { image: images, doc: docs, media: media, table: tables },
+      totalFound: images + docs + media + tables,
+      truncated: false
+    };
   }
 
   /* ==========================================================================
@@ -592,15 +851,15 @@
     return base;
   }
 
-  function buildFilename(folder, item, index, defaultExt) {
+  function buildFilename(folder, item, index) {
     let base = sanitizeFilename(item.name || '', 'file-' + (index + 1));
     if (!/\.[a-z0-9]{1,8}$/i.test(base)) {
       let ext = String(item.ext || '').toLowerCase();
       if (ext === 'file' || ext === 'img') ext = '';
-      if (!ext) ext = String(defaultExt || '').toLowerCase();
+      if (!ext) ext = '';
       if (ext) base += '.' + ext;
     }
-    return (folder || 'CTool') + '/' + base;
+    return (folder || DEFAULT_FOLDER) + '/' + base;
   }
 
   function textToDataUrl(text, mime) {
@@ -659,14 +918,27 @@
      通用下载面板
      ========================================================================== */
 
-  function createDownloader(root, spec) {
+  const TYPE_LABELS = {
+    image: '图片',
+    doc: '文档',
+    media: '媒体',
+    table: '表格'
+  };
+
+  const TYPE_ICONS = {
+    image: 'IMG',
+    doc: 'DOC',
+    media: 'MED',
+    table: 'TBL'
+  };
+
+  T.renderers.download = function renderDownload(root) {
     const state = {
       tabs: [],
       items: [],
       data: null,
       selected: new Set(),
       visibleIndices: [],
-      filters: {},
       scanning: false,
       downloading: false
     };
@@ -676,17 +948,16 @@
         <section class="card dl-card">
           <div class="card-head">
             <div class="card-heading">
-              <span class="card-icon">${escapeHtml(spec.icon)}</span>
-              <h2>${escapeHtml(spec.panelTitle)}</h2>
+              <span class="card-icon">↓</span><h2>网页下载</h2>
             </div>
-                        <div class="card-actions">
+            <div class="card-actions">
               <span class="badge" id="dl-page-badge">等待扫描</span>
-              <button class="btn btn-sm btn-primary" type="button" id="dl-scan">重新扫描</button>
+              <button class="btn btn-sm btn-primary" type="button" id="dl-scan">扫描页面</button>
             </div>
           </div>
 
           <div class="card-body">
-            <div class="dl-target" hidden>
+            <div class="dl-target">
               <label class="field dl-target-select">
                 <span class="field-label">目标网页</span>
                 <select class="select" id="dl-tab"></select>
@@ -694,15 +965,14 @@
               <div class="dl-target-info" id="dl-target-info">正在读取标签页…</div>
             </div>
 
-            <div class="dl-filters" id="dl-filters" hidden>
-<div class="dl-category-tabs" id="dl-category-tabs"></div>
+            <div class="dl-type-tabs" id="dl-type-tabs"></div>
+
             <div class="dl-result-head">
               <span id="dl-result-count">尚未扫描</span>
-              <span class="badge badge-warn" id="dl-truncated" hidden>结果已截断</span>
             </div>
 
             <div class="dl-results" id="dl-results">
-              <div class="dl-items ${escapeHtml(spec.containerClass || 'dl-list')}" id="dl-items"></div>
+              <div class="dl-items" id="dl-items"></div>
               <div class="empty-state dl-empty" id="dl-empty">正在准备…</div>
             </div>
           </div>
@@ -712,8 +982,9 @@
             <button class="btn" type="button" id="dl-select-all">全选当前</button>
             <button class="btn btn-ghost" type="button" id="dl-select-none">取消选择</button>
             <button class="btn btn-primary" type="button" id="dl-download" disabled>下载选中 (0)</button>
+            <button class="btn btn-accent" type="button" id="dl-zip" disabled>打包下载 ZIP</button>
             <span class="spacer"></span>
-            <button class="btn btn-ghost" type="button" id="dl-copy" disabled>${escapeHtml(spec.copyLabel || '复制链接')}</button>
+            <button class="btn btn-ghost" type="button" id="dl-copy" disabled>复制链接</button>
             <span class="status" id="dl-status"></span>
           </div>
         </section>
@@ -725,15 +996,16 @@
     const targetInfo = $('#dl-target-info', root);
     const pageBadge = $('#dl-page-badge', root);
     const resultCount = $('#dl-result-count', root);
-    const truncatedBadge = $('#dl-truncated', root);
     const itemsElement = $('#dl-items', root);
     const emptyElement = $('#dl-empty', root);
     const statusElement = $('#dl-status', root);
     const selectAllButton = $('#dl-select-all', root);
     const selectNoneButton = $('#dl-select-none', root);
     const downloadButton = $('#dl-download', root);
+    const zipButton = $('#dl-zip', root);
     const copyButton = $('#dl-copy', root);
     const selectionElement = $('#dl-selection', root);
+    const typeTabs = $('#dl-type-tabs', root);
 
     function selectedIndices() {
       return state.visibleIndices.filter((index) => state.selected.has(index));
@@ -750,61 +1022,147 @@
         ? '正在下载…'
         : '下载选中 (' + count + ')';
       downloadButton.disabled = state.downloading || state.scanning || count === 0;
+      zipButton.disabled = state.downloading || state.scanning || count === 0;
       copyButton.disabled = state.downloading || count === 0;
       selectAllButton.disabled = state.scanning || totalVisible === 0;
       selectNoneButton.disabled = state.scanning || state.selected.size === 0;
     }
 
-    function readFilters() {
-      const filters = {};
-      $$('[data-filter]', root).forEach((element) => {
-        filters[element.getAttribute('data-filter')] = element.value;
+    function renderTypeTabs() {
+      const counts = {};
+      state.items.forEach((item) => {
+        counts[item.type] = (counts[item.type] || 0) + 1;
       });
-      state.filters = filters;
+      const allCount = state.items.length;
+      const tabs = Object.entries(TYPE_LABELS).map(([type, label]) => {
+        const c = counts[type] || 0;
+        return '<button class="type-tab' + (type === state.activeType ? ' active' : '') + '" type="button" data-type="' + type + '">' +
+          '<span>' + TYPE_ICONS[type] + '</span>' +
+          '<span>' + label + '</span>' +
+          '<span class="type-count">(' + c + ')</span>' +
+          '</button>';
+      }).join('');
+      typeTabs.innerHTML = '<button class="type-tab' + (!state.activeType ? ' active' : '') + '" type="button" data-type="all">' +
+        '<span>↓</span><span>全部</span><span class="type-count">(' + allCount + ')</span>' +
+        '</button>' + tabs;
     }
 
-    function matchesFilters(item) {
-      if (!item) return false;
-      return spec.filter ? spec.filter(item, state.filters) : true;
+    function renderItems() {
+      const data = state.data;
+      setPageBadge(data ? '已扫描 · ' + state.items.length + ' 项' : '等待扫描', data ? 'badge-ok' : '');
+
+      if (!state.items.length) {
+        itemsElement.innerHTML = '';
+        emptyElement.textContent = '没有在页面中找到可下载的内容。';
+        emptyElement.hidden = false;
+        resultCount.textContent = '0 项';
+        state.visibleIndices = [];
+        updateFooter();
+        renderTypeTabs();
+        return;
+      }
+
+      emptyElement.hidden = true;
+
+      // 按类型分组
+      const groups = {};
+      state.items.forEach((item, index) => {
+        if (!groups[item.type]) groups[item.type] = [];
+        groups[item.type].push({ item, index });
+      });
+
+      let html = '';
+      const typeOrder = ['all', 'image', 'doc', 'media', 'table'];
+      const shownTypes = state.activeType === 'all' ? typeOrder : [state.activeType];
+
+      shownTypes.forEach((type) => {
+        const items = groups[type] || [];
+        if (!items.length) return;
+        const typeLabel = type === 'all' ? '全部' : TYPE_LABELS[type];
+        const typeIcon = type === 'all' ? '↓' : TYPE_ICONS[type];
+        const groupSelected = items.every((entry) => state.selected.has(entry.index));
+        html += '<div class="dl-type-group">';
+        html += '<div class="dl-type-group-head">';
+        html += '<label class="type-group-label"><input type="checkbox" class="type-group-checkbox" data-type="' + type + '"' + (groupSelected ? ' checked' : '') + '> <span>' + typeIcon + '</span> <span>' + typeLabel + '</span> <span class="type-group-count">(' + items.length + ')</span></label>';
+        html += '</div>';
+        html += '<div class="dl-type-group-items">';
+        items.forEach((entry) => {
+          const item = entry.item;
+          const index = entry.index;
+          const isSelected = state.selected.has(index);
+          const isImage = item.type === 'image';
+          const isTable = item.type === 'table';
+          html += '<div class="dl-item" data-index="' + index + '">';
+          html += '<label class="dl-item-row">';
+          html += '<input type="checkbox" class="dl-check" data-index="' + index + '"' + (isSelected ? ' checked' : '') + '>';
+          if (isImage) {
+            html += '<div class="dl-thumb-wrap"><img class="dl-thumb" src="' + escapeHtml(item.url) + '" alt="缩略图" loading="lazy"></div>';
+          } else if (isTable) {
+            html += '<div class="dl-table-preview"><div class="dl-table-grid">';
+            (item.preview || []).forEach((row) => {
+              html += '<div class="dl-table-row">';
+              row.forEach((cell) => {
+                html += '<div class="dl-table-cell">' + escapeHtml(cell) + '</div>';
+              });
+              html += '</div>';
+            });
+            html += '</div></div>';
+          }
+          html += '<div class="dl-item-info">';
+          html += '<div class="dl-item-name" title="' + escapeHtml(item.name || item.label || item.url) + '">' + escapeHtml(trimText(item.name || item.label || item.url, 90)) + '</div>';
+          html += '<div class="dl-item-meta">';
+          if (item.ext) html += '<span class="dl-item-ext">' + item.ext.toUpperCase() + '</span>';
+          if (item.width && item.height) html += '<span>' + item.width + ' × ' + item.height + '</span>';
+          if (item.source) html += '<span>' + escapeHtml(item.source) + '</span>';
+          html += '<span class="dl-url" title="' + escapeHtml(item.url) + '">' + shortUrl(item.url, 60) + '</span>';
+          html += '</div>';
+          html += '</div>';
+          html += '</label>';
+          html += '</div>';
+        });
+        html += '</div>';
+        html += '</div>';
+      });
+
+      itemsElement.innerHTML = html;
+
+      // 在每个下载按钮前显示条目序号（保留兼容）
+      $$('.dl-item', itemsElement).forEach((card) => {
+        const index = Number(card.getAttribute('data-index'));
+        const ordinal = document.createElement('span');
+        ordinal.className = 'dl-ordinal';
+        ordinal.textContent = (index + 1) + ' / ' + state.items.length + ' 项';
+        card.insertBefore(ordinal, card.firstChild);
+      });
+
+      applyFilters();
+      renderTypeTabs();
     }
 
     function applyFilters() {
-      readFilters();
       let visible = 0;
       state.visibleIndices = [];
       $$('.dl-item', itemsElement).forEach((card) => {
         const index = Number(card.getAttribute('data-index'));
-        const show = matchesFilters(state.items[index]);
+        const item = state.items[index];
+        const show = state.activeType === 'all' || item.type === state.activeType;
         card.hidden = !show;
         if (show) {
           visible += 1;
           state.visibleIndices.push(index);
         }
       });
-
       if (state.items.length) {
         resultCount.textContent = '显示 ' + visible + ' / ' + state.items.length + ' 项';
-        if (visible === 0) {
-          emptyElement.textContent = '当前筛选条件下没有匹配结果';
-          emptyElement.hidden = false;
-        } else {
-          emptyElement.hidden = true;
-        }
       } else {
         resultCount.textContent = '0 项';
       }
       updateFooter();
     }
 
-    function updateTargetInfo() {
-      const tab = state.tabs.find((entry) => String(entry.id) === tabSelect.value);
-      if (!tab) {
-        targetInfo.textContent = '没有可扫描的网页标签页';
-        return;
-      }
-      targetInfo.innerHTML =
-        '<strong title="' + escapeHtml(tab.title || '') + '">' + escapeHtml(trimText(tab.title || tab.url || '未命名页面', 90)) + '</strong>' +
-        '<span title="' + escapeHtml(tab.url || '') + '">' + escapeHtml(hostOf(tab.url || '') || tab.url || '') + '</span>';
+    function setPageBadge(text, type) {
+      pageBadge.textContent = text;
+      pageBadge.className = 'badge' + (type ? ' ' + type : '');
     }
 
     async function loadTabs(preferredId) {
@@ -856,94 +1214,28 @@
       updateTargetInfo();
     }
 
-    function setPageBadge(text, type) {
-      pageBadge.textContent = text;
-      pageBadge.className = 'badge' + (type ? ' ' + type : '');
-    }
-
-    function renderEmpty(message) {
-      itemsElement.innerHTML = '';
-      emptyElement.textContent = message;
-      emptyElement.hidden = false;
-      resultCount.textContent = '0 项';
-      truncatedBadge.hidden = true;
-      state.visibleIndices = [];
-      updateFooter();
-    }
-
-    function renderItems() {
-      const data = state.data;
-      setPageBadge(data ? '已扫描 · ' + state.items.length + ' 项' : '等待扫描', data ? 'badge-ok' : '');
-      truncatedBadge.hidden = !(data && data.truncated);
-      if (data && data.truncated) {
-        truncatedBadge.textContent = '结果已截断，仅显示部分内容';
-      }
-
-      if (!state.items.length) {
-        renderEmpty(spec.emptyText || '没有找到可下载的内容。');
+    function updateTargetInfo() {
+      const tab = state.tabs.find((entry) => String(entry.id) === tabSelect.value);
+      if (!tab) {
+        targetInfo.textContent = '没有可扫描的网页标签页';
         return;
       }
-
-      // 按资源来源分组显示，方便用户按类型选择下载
-      const groups = {};
-      state.items.forEach((item, index) => {
-        const groupKey = item.source || 'other';
-        if (!groups[groupKey]) groups[groupKey] = [];
-        groups[groupKey].push({ item, index });
-      });
-      const groupLabels = { img: '图片', background: '背景图', poster: '视频封面', canvas: '画布', meta: '分享图', doc: '文档', table: '表格', media: '媒体', other: '其他' };
-      let html = '';
-      Object.keys(groups).forEach((key) => {
-        const items = groups[key];
-        html += '<div class="dl-group"><div class="dl-group-title">' + escapeHtml(groupLabels[key] || key) + ' <span class="dl-group-count">(' + items.length + ')</span></div><div class="dl-group-items">' + items.map((entry) => spec.renderItem(entry.item, entry.index, state)).join('') + '</div></div>';
-      });
-      itemsElement.innerHTML = html;
-      emptyElement.hidden = true;
-
-      // 在每个下载按钮前显示条目序号，便于确认当前处理到第几项。
-      $$('.dl-item', itemsElement).forEach((card) => {
-        const index = Number(card.getAttribute('data-index'));
-        const buttons = $$('[data-download-item]', card);
-        buttons.forEach((button) => {
-          if (button.previousElementSibling && button.previousElementSibling.classList.contains('dl-ordinal')) return;
-          const ordinal = document.createElement('span');
-          ordinal.className = 'dl-ordinal';
-          ordinal.textContent = (index + 1) + ' / ' + state.items.length + ' 项';
-          button.parentNode.insertBefore(ordinal, button);
-        });
-      });
-
-      $$('img[data-dl-preview]', itemsElement).forEach((img) => {
-        img.addEventListener('error', () => {
-          img.classList.add('dl-image-broken');
-          const thumb = img.closest('.dl-thumb');
-          if (thumb) thumb.classList.add('dl-thumb-broken');
-        }, { once: true });
-      });
-
-      if (spec.afterRender) spec.afterRender(itemsElement, state);
-      applyFilters();
-    }
-
-    function setSelected(index, selected) {
-      if (selected) state.selected.add(index);
-      else state.selected.delete(index);
-      const card = itemsElement.querySelector('.dl-item[data-index="' + index + '"]');
-      if (card) card.classList.toggle('selected', selected);
-      const checkbox = itemsElement.querySelector('.dl-check[data-index="' + index + '"]');
-      if (checkbox) checkbox.checked = selected;
-      updateFooter();
+      targetInfo.innerHTML =
+        '<strong title="' + escapeHtml(tab.title || '') + '">' + escapeHtml(trimText(tab.title || tab.url || '未命名页面', 90)) + '</strong>' +
+        '<span title="' + escapeHtml(tab.url || '') + '">' + escapeHtml(hostOf(tab.url || '') || tab.url || '') + '</span>';
     }
 
     async function scan() {
       if (state.scanning) return;
       if (!extensionReady()) {
-        renderEmpty('扩展接口不可用，请重新加载扩展。');
+        emptyElement.textContent = '扩展接口不可用，请重新加载扩展。';
+        emptyElement.hidden = false;
         return;
       }
       const tabId = Number(tabSelect.value);
       if (!tabId) {
-        renderEmpty('请先选择一个可扫描的网页标签页。');
+        emptyElement.textContent = '请先选择一个可扫描的网页标签页。';
+        emptyElement.hidden = false;
         return;
       }
 
@@ -956,14 +1248,14 @@
       try {
         const results = await chrome.scripting.executeScript({
           target: { tabId: tabId },
-          func: scanPageResources,
-          args: [spec.kind]
+          func: scanAllResources
         });
         const data = results && results[0] ? results[0].result : null;
-        if (!data || data.kind !== spec.kind) throw new Error('页面没有返回有效的扫描结果');
+        if (!data) throw new Error('页面没有返回有效的扫描结果');
         state.data = data;
         state.items = Array.isArray(data.items) ? data.items : [];
         state.selected.clear();
+        state.activeType = 'all';
         renderItems();
         if (state.items.length) {
           setStatus(statusElement, '扫描完成，共找到 ' + state.items.length + ' 项', 'ok');
@@ -976,7 +1268,8 @@
         state.items = [];
         state.selected.clear();
         setPageBadge('扫描失败', 'badge-error');
-        renderEmpty(friendlyScanError(error));
+        emptyElement.textContent = friendlyScanError(error);
+        emptyElement.hidden = false;
         setStatus(statusElement, '扫描失败', 'error');
       } finally {
         state.scanning = false;
@@ -986,12 +1279,7 @@
       }
     }
 
-    async function saveItem(item, index) {
-      if (spec.saveItem) return spec.saveItem(item, index, state, downloadUrl);
-      return downloadUrl(item.url, buildFilename(spec.folder || DEFAULT_FOLDERS[spec.kind], item, index, spec.defaultExt));
-    }
-
-    async function downloadIndices(indices, single) {
+    async function downloadIndices(indices) {
       if (state.downloading) return;
       const unique = Array.from(new Set(indices)).filter((index) => state.items[index]);
       if (!unique.length) {
@@ -1006,13 +1294,14 @@
 
       for (let offset = 0; offset < unique.length; offset += 1) {
         const index = unique[offset];
+        const item = state.items[index];
         setStatus(statusElement, '正在下载 ' + (offset + 1) + ' / ' + unique.length + '…', 'info');
         try {
-          await saveItem(state.items[index], index);
+          await downloadUrl(item.url, buildFilename(DEFAULT_FOLDER, item, index));
           success += 1;
         } catch (error) {
           failed += 1;
-          console.warn('CTool download failed:', state.items[index] && state.items[index].url, error);
+          console.warn('CTool download failed:', item && item.url, error);
         }
         if (unique.length > 1) await sleep(120);
       }
@@ -1022,8 +1311,8 @@
         setStatus(statusElement, '已开始下载 ' + success + ' 项，' + failed + ' 项失败', 'warn');
         showToast('有 ' + failed + ' 项下载失败，可尝试使用原链接', 'warn');
       } else {
-        setStatus(statusElement, single && success === 1 ? '已开始下载' : '已开始下载 ' + success + ' 项', 'ok');
-        if (!single) showToast('已开始下载 ' + success + ' 项');
+        setStatus(statusElement, '已开始下载 ' + success + ' 项', 'ok');
+        showToast('已开始下载 ' + success + ' 项');
       }
       updateFooter();
     }
@@ -1034,10 +1323,8 @@
         showToast('请先选择内容', 'warn');
         return;
       }
-      const values = indices.map((index) => spec.copyValue
-        ? spec.copyValue(state.items[index], state)
-        : state.items[index].url);
-      copyText(values.join(spec.copySeparator || '\n'));
+      const values = indices.map((index) => state.items[index].url);
+      copyText(values.join('\n'));
     }
 
     function syncCheckboxes() {
@@ -1048,6 +1335,12 @@
         const card = checkbox.closest('.dl-item');
         if (card) card.classList.toggle('selected', checked);
       });
+      // 类型分组复选框渲染在 #dl-items 内，需要在这里同步状态
+      $$('.type-group-checkbox', itemsElement).forEach((checkbox) => {
+        const type = checkbox.getAttribute('data-type');
+        const relevant = state.items.filter((item) => item.type === type);
+        checkbox.checked = relevant.length > 0 && relevant.every((item) => state.selected.has(state.items.indexOf(item)));
+      });
     }
 
     scanButton.addEventListener('click', scan);
@@ -1057,8 +1350,45 @@
       scan();
     });
 
-    $('#dl-filters', root).addEventListener('input', applyFilters);
-    $('#dl-filters', root).addEventListener('change', applyFilters);
+    typeTabs.addEventListener('click', (event) => {
+      const btn = event.target.closest('[data-type]');
+      if (!btn) return;
+      state.activeType = btn.getAttribute('data-type');
+      renderTypeTabs();
+      applyFilters();
+    });
+
+    itemsElement.addEventListener('change', (event) => {
+      const groupCheckbox = event.target.closest('.type-group-checkbox');
+      if (groupCheckbox) {
+        const type = groupCheckbox.getAttribute('data-type');
+        const relevant = type === 'all' ? state.items : state.items.filter((item) => item.type === type);
+        relevant.forEach((item) => {
+          const index = state.items.indexOf(item);
+          if (index === -1) return;
+          if (groupCheckbox.checked) state.selected.add(index);
+          else state.selected.delete(index);
+        });
+        syncCheckboxes();
+        updateFooter();
+        return;
+      }
+      const checkbox = event.target.closest('.dl-check');
+      if (!checkbox) return;
+      const index = Number(checkbox.getAttribute('data-index'));
+      if (checkbox.checked) state.selected.add(index);
+      else state.selected.delete(index);
+      syncCheckboxes();
+      updateFooter();
+    });
+
+    itemsElement.addEventListener('click', (event) => {
+      const downloadItemButton = event.target.closest('[data-download-item]');
+      if (downloadItemButton) {
+        event.preventDefault();
+        downloadIndices([Number(downloadItemButton.getAttribute('data-download-item'))], true);
+      }
+    });
 
     selectAllButton.addEventListener('click', () => {
       state.visibleIndices.forEach((index) => state.selected.add(index));
@@ -1073,56 +1403,73 @@
     });
 
     downloadButton.addEventListener('click', () => downloadIndices(selectedIndices(), false));
-    copyButton.addEventListener('click', copySelection);
-
-    itemsElement.addEventListener('change', (event) => {
-      const checkbox = event.target.closest('.dl-check');
-      if (!checkbox) return;
-      setSelected(Number(checkbox.getAttribute('data-index')), checkbox.checked);
-    });
-
-    itemsElement.addEventListener('click', (event) => {
-      const previewButton = event.target.closest('[data-preview]');
-      if (previewButton) {
-        const index = Number(previewButton.getAttribute('data-preview'));
-        const item = state.items[index];
-        if (item) {
-          if (!/^(https?|file):/i.test(item.url)) {
-            showToast('内嵌图片不支持新标签页预览，可直接下载');
-            return;
+    zipButton.addEventListener('click', async () => {
+      const indices = selectedIndices();
+      if (!indices.length) {
+        showToast('请先选择要打包的内容', 'warn');
+        return;
+      }
+      if (typeof JSZip === 'undefined') {
+        showToast('压缩库未加载，请重新加载扩展', 'error');
+        return;
+      }
+      state.downloading = true;
+      updateFooter();
+      try {
+        const zip = new JSZip();
+        const usedNames = new Set();
+        let success = 0;
+        let failed = 0;
+        for (let i = 0; i < indices.length; i++) {
+          const index = indices[i];
+          const item = state.items[index];
+          if (!item) continue;
+          setStatus(statusElement, '正在打包 ' + (i + 1) + ' / ' + indices.length + '…', 'info');
+          try {
+            const response = await fetch(item.url);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            const blob = await response.blob();
+            let entryName = item.name || ('file-' + (index + 1));
+            if (usedNames.has(entryName)) {
+              const dot = entryName.lastIndexOf('.');
+              const base = dot > 0 ? entryName.slice(0, dot) : entryName;
+              const extPart = dot > 0 ? entryName.slice(dot) : '';
+              let suffix = 2;
+              while (usedNames.has(base + ' (' + suffix + ')' + extPart)) suffix += 1;
+              entryName = base + ' (' + suffix + ')' + extPart;
+            }
+            usedNames.add(entryName);
+            zip.file(entryName, blob);
+            success += 1;
+          } catch (error) {
+            failed += 1;
+            console.warn('ZIP fetch failed:', item.url, error);
           }
-          window.open(item.url, '_blank', 'noopener');
-          showToast('已在新标签页打开原图');
         }
-        return;
-      }
-
-      const copyItemButton = event.target.closest('[data-copy-item]');
-      if (copyItemButton) {
-        const index = Number(copyItemButton.getAttribute('data-copy-item'));
-        const item = state.items[index];
-        if (item) copyText(spec.copyValue ? spec.copyValue(item, state) : item.url);
-        return;
-      }
-
-      const downloadItemButton = event.target.closest('[data-download-item]');
-      if (downloadItemButton) {
-        event.preventDefault();
-        downloadIndices([Number(downloadItemButton.getAttribute('data-download-item'))], true);
+        const content = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(content);
+        chrome.downloads.download({
+          url: url,
+          filename: 'ctool-downloads.zip',
+          conflictAction: 'uniquify',
+          saveAs: false
+        });
+        URL.revokeObjectURL(url);
+        if (failed) {
+          setStatus(statusElement, '已打包 ' + success + ' 项，' + failed + ' 项失败', 'warn');
+          showToast('有 ' + failed + ' 项打包失败', 'warn');
+        } else {
+          setStatus(statusElement, '已打包下载 ' + success + ' 项', 'ok');
+          showToast('已打包下载 ' + success + ' 项', 'ok');
+        }
+      } catch (error) {
+        setStatus(statusElement, '打包失败：' + (error.message || '未知错误'), 'error');
+      } finally {
+        state.downloading = false;
+        updateFooter();
       }
     });
-
-    function onStorageChanged(changes, area) {
-      if (area !== 'local' || !changes.ctool_source_tab) return;
-      const sourceTabId = changes.ctool_source_tab.newValue;
-      if (typeof sourceTabId !== 'number') return;
-      if (state.downloading) return;
-      loadTabs(sourceTabId).then(() => scan());
-    }
-
-    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
-      chrome.storage.onChanged.addListener(onStorageChanged);
-    }
+    copyButton.addEventListener('click', copySelection);
 
     loadTabs().then(() => {
       if (state.tabs.length) {
@@ -1137,317 +1484,5 @@
         chrome.storage.onChanged.removeListener(onStorageChanged);
       }
     };
-  }
-
-  /* ==========================================================================
-     图片下载
-     ========================================================================== */
-
-  const IMAGE_EXT_OPTIONS = [
-    ['', '全部格式'],
-    ['jpg', 'JPG / JPEG'],
-    ['png', 'PNG'],
-    ['gif', 'GIF'],
-    ['webp', 'WebP'],
-    ['svg', 'SVG'],
-    ['avif', 'AVIF'],
-    ['other', '其他格式']
-  ];
-
-  T.renderers.images = function renderImages(root) {
-    return createDownloader(root, {
-      kind: 'images',
-      icon: 'IMG',
-      panelTitle: '图片下载',
-      folder: DEFAULT_FOLDERS.images,
-      containerClass: 'dl-image-grid',
-      defaultExt: 'jpg',
-      emptyText: '没有在页面中找到图片。可以尝试滚动页面加载懒加载图片后重新扫描。',
-      copyLabel: '复制图片链接',
-      filtersHtml: `
-        <div class="dl-filter-row">
-          <label class="field dl-filter-grow">
-            <span class="field-label">筛选名称 / 描述 / 域名</span>
-            <input class="input" type="search" data-filter="text" placeholder="输入关键词…" autocomplete="off">
-          </label>
-          <label class="field dl-filter-narrow">
-            <span class="field-label">最小宽度</span>
-            <input class="input" type="number" min="0" step="10" value="0" data-filter="minWidth">
-          </label>
-          <label class="field dl-filter-narrow">
-            <span class="field-label">格式</span>
-            <select class="select" data-filter="ext">
-              ${IMAGE_EXT_OPTIONS.map(([value, label]) => '<option value="' + value + '">' + label + '</option>').join('')}
-            </select>
-          </label>
-        </div>
-      `,
-      filter: function (item, filters) {
-        const query = String(filters.text || '').trim().toLowerCase();
-        if (query) {
-          const haystack = (item.name + ' ' + item.alt + ' ' + item.url + ' ' + hostOf(item.url)).toLowerCase();
-          if (!haystack.includes(query)) return false;
-        }
-        const minWidth = Number(filters.minWidth) || 0;
-        if (minWidth > 0 && item.width > 0 && item.width < minWidth) return false;
-        const ext = String(filters.ext || '');
-        if (ext) {
-          const itemExt = item.ext === 'jpeg' ? 'jpg' : item.ext;
-          const common = ['jpg', 'png', 'gif', 'webp', 'svg', 'avif'];
-          if (ext === 'other' ? common.includes(itemExt) : itemExt !== ext) return false;
-        }
-        return true;
-      },
-      renderItem: function (item, index) {
-        const dimensions = item.width && item.height ? item.width + ' × ' + item.height : '尺寸未知';
-        const sourceLabels = { img: '图片', background: '背景图', poster: '视频封面', canvas: '画布', meta: '分享图' };
-        return `
-          <div class="dl-item dl-image-item" data-index="${index}">
-            <button class="dl-thumb" type="button" data-preview="${index}" title="点击查看原图">
-              <img data-dl-preview src="${escapeHtml(item.url)}" alt="${escapeHtml(item.alt || item.name)}" loading="lazy">
-              <span class="dl-thumb-overlay">查看原图</span>
-            </button>
-            <div class="dl-image-body">
-              <label class="dl-name-line">
-                <input class="dl-check" type="checkbox" data-index="${index}" aria-label="选择 ${escapeHtml(item.name)}">
-                <span title="${escapeHtml(item.name)}">${escapeHtml(trimText(item.name, 64))}</span>
-              </label>
-              <div class="dl-image-meta">
-                <span class="badge badge-accent">${escapeHtml((item.ext || 'img').toUpperCase())}</span>
-                <span>${escapeHtml(dimensions)}</span>
-                <span class="dl-dot"></span>
-                <span>${escapeHtml(sourceLabels[item.source] || '图片')}</span>
-              </div>
-              <div class="dl-image-foot">
-                <span class="dl-url" title="${escapeHtml(item.url)}">${escapeHtml(hostOf(item.url) || shortUrl(item.url, 32))}</span>
-                <button class="btn btn-sm" type="button" data-download-item="${index}">下载</button>
-              </div>
-            </div>
-          </div>
-        `;
-      }
-    });
   };
-
-  /* ==========================================================================
-     文档下载
-     ========================================================================== */
-
-  const DOC_TYPE_OPTIONS = [
-    ['', '全部类型'],
-    ['pdf', 'PDF'],
-    ['document', '文档'],
-    ['spreadsheet', '表格'],
-    ['presentation', '演示文稿'],
-    ['ebook', '电子书'],
-    ['archive', '压缩包 / 镜像'],
-    ['other', '其他文件']
-  ];
-
-  T.renderers.docs = function renderDocs(root) {
-    return createDownloader(root, {
-      kind: 'docs',
-      icon: 'DOC',
-      panelTitle: '文档下载',
-      folder: DEFAULT_FOLDERS.docs,
-      containerClass: 'dl-list',
-      defaultExt: '',
-      emptyText: '没有在页面中找到 PDF、Office、压缩包等文件链接。',
-      copyLabel: '复制文件链接',
-      filtersHtml: `
-        <div class="dl-filter-row">
-          <label class="field dl-filter-grow">
-            <span class="field-label">筛选文件名 / 链接文字 / 域名</span>
-            <input class="input" type="search" data-filter="text" placeholder="输入关键词…" autocomplete="off">
-          </label>
-          <label class="field dl-filter-narrow">
-            <span class="field-label">类型</span>
-            <select class="select" data-filter="type">
-              ${DOC_TYPE_OPTIONS.map(([value, label]) => '<option value="' + value + '">' + label + '</option>').join('')}
-            </select>
-          </label>
-        </div>
-      `,
-      filter: function (item, filters) {
-        const query = String(filters.text || '').trim().toLowerCase();
-        if (query) {
-          const haystack = (item.name + ' ' + item.label + ' ' + item.url + ' ' + hostOf(item.url)).toLowerCase();
-          if (!haystack.includes(query)) return false;
-        }
-        if (filters.type && item.type !== filters.type) return false;
-        return true;
-      },
-      renderItem: function (item, index) {
-        return `
-          <div class="dl-item dl-file-item" data-index="${index}">
-            <input class="dl-check" type="checkbox" data-index="${index}" aria-label="选择 ${escapeHtml(item.name)}">
-            <span class="dl-type-icon">${escapeHtml((item.ext || 'file').toUpperCase().slice(0, 4))}</span>
-            <div class="dl-file-main">
-              <strong title="${escapeHtml(item.label)}">${escapeHtml(trimText(item.label || item.name, 90))}</strong>
-              <div class="dl-file-meta">
-                <span class="dl-url" title="${escapeHtml(item.url)}">${escapeHtml(item.name)}</span>
-                <span class="dl-dot"></span>
-                <span>${escapeHtml(hostOf(item.url) || '本地文件')}</span>
-              </div>
-            </div>
-            <button class="btn btn-sm" type="button" data-download-item="${index}">下载</button>
-          </div>
-        `;
-      }
-    });
-  };
-
-  /* ==========================================================================
-     媒体下载
-     ========================================================================== */
-
-  const MEDIA_TYPE_OPTIONS = [
-    ['', '全部媒体'],
-    ['video', '视频'],
-    ['audio', '音频']
-  ];
-
-  function formatDuration(seconds) {
-    const value = Number(seconds) || 0;
-    if (!value) return '';
-    const total = Math.round(value);
-    const hours = Math.floor(total / 3600);
-    const minutes = Math.floor((total % 3600) / 60);
-    const secs = total % 60;
-    return (hours ? hours + ':' + String(minutes).padStart(2, '0') : String(minutes)) + ':' + String(secs).padStart(2, '0');
-  }
-
-  T.renderers.media = function renderMedia(root) {
-    return createDownloader(root, {
-      kind: 'media',
-      icon: 'MED',
-      panelTitle: '媒体下载',
-      folder: DEFAULT_FOLDERS.media,
-      containerClass: 'dl-list',
-      defaultExt: 'mp4',
-      emptyText: '没有在页面中找到视频、音频或流媒体直链。受 DRM 保护的媒体无法直接下载。',
-      copyLabel: '复制媒体链接',
-      filtersHtml: `
-        <div class="dl-filter-row">
-          <label class="field dl-filter-grow">
-            <span class="field-label">筛选标题 / 文件名 / 域名</span>
-            <input class="input" type="search" data-filter="text" placeholder="输入关键词…" autocomplete="off">
-          </label>
-          <label class="field dl-filter-narrow">
-            <span class="field-label">媒体类型</span>
-            <select class="select" data-filter="type">
-              ${MEDIA_TYPE_OPTIONS.map(([value, label]) => '<option value="' + value + '">' + label + '</option>').join('')}
-            </select>
-          </label>
-        </div>
-      `,
-      filter: function (item, filters) {
-        const query = String(filters.text || '').trim().toLowerCase();
-        if (query) {
-          const haystack = (item.name + ' ' + item.label + ' ' + item.url + ' ' + hostOf(item.url)).toLowerCase();
-          if (!haystack.includes(query)) return false;
-        }
-        if (filters.type && item.mediaType !== filters.type) return false;
-        return true;
-      },
-      renderItem: function (item, index) {
-        const duration = formatDuration(item.duration);
-        return `
-          <div class="dl-item dl-file-item" data-index="${index}">
-            <input class="dl-check" type="checkbox" data-index="${index}" aria-label="选择 ${escapeHtml(item.name)}">
-            <span class="dl-type-icon dl-media-icon">${item.mediaType === 'audio' ? 'AUD' : 'VID'}</span>
-            <div class="dl-file-main">
-              <strong title="${escapeHtml(item.label)}">${escapeHtml(trimText(item.label || item.name, 90))}</strong>
-              <div class="dl-file-meta">
-                <span class="dl-url" title="${escapeHtml(item.url)}">${escapeHtml(item.name)}</span>
-                <span class="dl-dot"></span>
-                <span>${escapeHtml(hostOf(item.url) || '本地文件')}</span>
-                ${duration ? '<span class="dl-dot"></span><span>' + escapeHtml(duration) + '</span>' : ''}
-                ${item.stream ? '<span class="badge badge-warn">流媒体清单</span>' : ''}
-              </div>
-            </div>
-            <button class="btn btn-sm" type="button" data-download-item="${index}">下载</button>
-          </div>
-        `;
-      }
-    });
-  };
-
-  /* ==========================================================================
-     表格下载
-     ========================================================================== */
-
-  function renderTablePreview(item) {
-    if (!item.preview || !item.preview.length) {
-      return '<div class="dl-table-empty">空表格</div>';
-    }
-    const rows = item.preview.map((row, rowIndex) => {
-      const tag = item.hasHeader && rowIndex === 0 ? 'th' : 'td';
-      return '<tr>' + row.map((cell) =>
-        '<' + tag + '>' + escapeHtml(cell) + '</' + tag + '>'
-      ).join('') + '</tr>';
-    }).join('');
-    return '<div class="dl-table-scroll"><table class="dl-table-preview">' + rows + '</table></div>';
-  }
-
-  T.renderers.tables = function renderTables(root) {
-    return createDownloader(root, {
-      kind: 'tables',
-      icon: 'TBL',
-      panelTitle: '表格下载',
-      folder: DEFAULT_FOLDERS.tables,
-      containerClass: 'dl-table-list',
-      emptyText: '没有在页面中找到 HTML 表格。图片里的表格或前端虚拟列表无法直接导出。',
-      copyLabel: '复制选中 CSV',
-      copySeparator: '\n\n',
-      copyValue: function (item) {
-        return item.csv || '';
-      },
-      filtersHtml: `
-        <div class="dl-filter-row">
-          <label class="field dl-filter-grow">
-            <span class="field-label">筛选表格标题</span>
-            <input class="input" type="search" data-filter="text" placeholder="输入关键词…" autocomplete="off">
-          </label>
-          <label class="field dl-filter-narrow">
-            <span class="field-label">最少行数</span>
-            <input class="input" type="number" min="0" step="1" value="0" data-filter="minRows">
-          </label>
-        </div>
-      `,
-      filter: function (item, filters) {
-        const query = String(filters.text || '').trim().toLowerCase();
-        if (query && !(item.title || '').toLowerCase().includes(query)) return false;
-        const minRows = Number(filters.minRows) || 0;
-        return item.rows >= minRows;
-      },
-      renderItem: function (item, index) {
-        const previewNote = item.cols > item.previewCols
-          ? '预览前 ' + item.previewCols + ' 列'
-          : '';
-        return `
-          <div class="dl-item dl-table-item" data-index="${index}">
-            <div class="dl-table-head">
-              <input class="dl-check" type="checkbox" data-index="${index}" aria-label="选择 ${escapeHtml(item.title)}">
-              <div class="dl-table-title">
-                <strong title="${escapeHtml(item.title)}">${escapeHtml(trimText(item.title, 90))}</strong>
-                <span>${item.rows} 行 × ${item.cols} 列${item.truncated ? ' · 内容已截断' : ''}${previewNote ? ' · ' + previewNote : ''}</span>
-              </div>
-              <div class="dl-table-actions">
-                <button class="btn btn-sm" type="button" data-copy-item="${index}">复制 CSV</button>
-                <button class="btn btn-sm btn-primary" type="button" data-download-item="${index}">下载 CSV</button>
-              </div>
-            </div>
-            ${renderTablePreview(item)}
-          </div>
-        `;
-      },
-      saveItem: async function (item, index, state, downloadUrlApi) {
-        const filename = 'CTool/表格/' + sanitizeFilename(item.name || ('table-' + (index + 1) + '.csv'), 'table-' + (index + 1) + '.csv');
-        await downloadUrlApi(textToDataUrl('\ufeff' + (item.csv || ''), 'text/csv'), filename);
-      }
-    });
-  };
-
-  T.scanPageResources = scanPageResources;
 })();

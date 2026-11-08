@@ -3,7 +3,7 @@
   'use strict';
 
   const T = window.CTool;
-  const { $, $$, escapeHtml, bindCopyButtons, downloadText, setStatus, showToast, debounce } = T;
+  const { $, $$, escapeHtml, bindCopyButtons, downloadText, bindCtrlEnter, setStatus, showToast, debounce, setupTabs } = T;
 
   /* ==========================================================================
      哈希计算
@@ -16,15 +16,49 @@
     { id: 'sha384', name: 'SHA-384', bits: 384, subtle: 'SHA-384' },
     { id: 'sha512', name: 'SHA-512', bits: 512, subtle: 'SHA-512' }
   ];
+  const EXTRA_HASH_ROWS = [
+    { id: 'hmac', name: 'HMAC', bits: 0 },
+    { id: 'crc32', name: 'CRC32', bits: 32 }
+  ];
+  const ALL_HASH_ROWS = HASH_ALGORITHMS.concat(EXTRA_HASH_ROWS);
+  const HMAC_ALGORITHMS = {
+    'SHA-1': 'HMAC-SHA1', 'SHA-256': 'HMAC-SHA256',
+    'SHA-384': 'HMAC-SHA384', 'SHA-512': 'HMAC-SHA512'
+  };
+  const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i += 1) {
+      let value = i;
+      for (let bit = 0; bit < 8; bit += 1) {
+        value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+      }
+      table[i] = value >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32Hex(bytes) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i += 1) {
+      crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
+  }
+
+  async function hmacHex(hash, secret, bytes) {
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: hash }, false, ['sign']);
+    const signature = await crypto.subtle.sign('HMAC', key, bytes);
+    return T.bytesToHex(new Uint8Array(signature));
+  }
 
   T.renderers.hash = function renderHash(root, ctx) {
     const context = ctx || {};
     let latest = {};
     let sequence = 0;
 
-    const rows = HASH_ALGORITHMS.map((algorithm) => `
+    const rows = ALL_HASH_ROWS.map((algorithm) => `
       <div class="result-row">
-        <div class="result-label">${algorithm.name}<small>${algorithm.bits} bit</small></div>
+        <div class="result-label" id="hash-label-${algorithm.id}">${algorithm.name}<small>${algorithm.bits ? algorithm.bits + ' bit' : T.t('需密钥')}</small></div>
         <code class="result-value" id="hash-${algorithm.id}">—</code>
         <button class="copy-mini" type="button" data-copy="hash-${algorithm.id}">复制</button>
       </div>
@@ -45,6 +79,21 @@
           </div>
           <div class="card-body">
             <textarea id="hash-input" class="code-area wrap" spellcheck="false" placeholder="输入需要计算哈希的文本（UTF-8）…"></textarea>
+            <div class="form-grid">
+              <label class="field">
+                <span class="field-label">HMAC 密钥</span>
+                <input class="input" id="hash-secret" type="text" spellcheck="false" placeholder="填写密钥后计算 HMAC">
+              </label>
+              <label class="field">
+                <span class="field-label">HMAC 算法</span>
+                <select class="select" id="hash-hmac-alg">
+                  <option value="SHA-256" selected>HMAC-SHA256</option>
+                  <option value="SHA-1">HMAC-SHA1</option>
+                  <option value="SHA-384">HMAC-SHA384</option>
+                  <option value="SHA-512">HMAC-SHA512</option>
+                </select>
+              </label>
+            </div>
             <div class="row-between">
               <div class="notice" style="flex:1;">MD5 / SHA-1 仅适合校验，不建议用于密码或安全签名场景。</div>
               <span class="status" id="hash-status"></span>
@@ -72,13 +121,15 @@
     const upper = $('#hash-upper', root);
     const status = $('#hash-status', root);
     const meta = $('#hash-meta', root);
+    const secret = $('#hash-secret', root);
+    const hmacAlg = $('#hash-hmac-alg', root);
 
     function hexFromBuffer(buffer) {
       return T.bytesToHex(new Uint8Array(buffer));
     }
 
     function renderValues() {
-      HASH_ALGORITHMS.forEach((algorithm) => {
+      ALL_HASH_ROWS.forEach((algorithm) => {
         const element = document.getElementById('hash-' + algorithm.id);
         const value = latest[algorithm.id];
         if (!element) return;
@@ -100,7 +151,7 @@
       }
 
       const bytes = new TextEncoder().encode(text);
-      const nextValues = { md5: T.md5(text) };
+      const nextValues = { md5: T.md5(text), crc32: crc32Hex(bytes) };
 
       try {
         await Promise.all(
@@ -109,6 +160,9 @@
             nextValues[algorithm.id] = hexFromBuffer(digest);
           })
         );
+        if (secret.value) {
+          nextValues.hmac = await hmacHex(hmacAlg.value, secret.value, bytes);
+        }
       } catch (error) {
         if (current === sequence) {
           setStatus(status, '浏览器不支持该哈希算法：' + error.message, 'error');
@@ -119,6 +173,11 @@
       if (current !== sequence) return;
 
       latest = nextValues;
+      const hmacLabel = $('#hash-label-hmac', root);
+      if (hmacLabel) {
+        hmacLabel.innerHTML = escapeHtml(HMAC_ALGORITHMS[hmacAlg.value] || 'HMAC') +
+          '<small>' + (secret.value ? escapeHtml(hmacAlg.value) : T.t('需密钥')) + '</small>';
+      }
       renderValues();
       setStatus(status, '✓ 计算完成', 'ok');
       meta.textContent = text.length + ' 字符 · ' + bytes.length + ' 字节（UTF-8）';
@@ -128,6 +187,8 @@
 
     input.addEventListener('input', debouncedCompute);
     upper.addEventListener('change', renderValues);
+    secret.addEventListener('input', debouncedCompute);
+    hmacAlg.addEventListener('change', debouncedCompute);
 
     $('#hash-clear', root).addEventListener('click', () => {
       input.value = '';
@@ -143,7 +204,7 @@
         showToast('还没有可复制的结果', 'warn');
         return;
       }
-      const lines = HASH_ALGORITHMS.map((algorithm) => {
+      const lines = ALL_HASH_ROWS.map((algorithm) => {
         const value = latest[algorithm.id] || '';
         return algorithm.name + ': ' + (upper.checked ? value.toUpperCase() : value);
       });
@@ -155,7 +216,7 @@
         showToast('还没有可下载的结果', 'warn');
         return;
       }
-      const lines = HASH_ALGORITHMS.map((algorithm) => {
+      const lines = ALL_HASH_ROWS.map((algorithm) => {
         const value = latest[algorithm.id] || '';
         return algorithm.name + ': ' + (upper.checked ? value.toUpperCase() : value);
       });
@@ -387,62 +448,185 @@
   };
 
   /* ==========================================================================
-     JWT 解析
+     JWT 解析 / 签发 / 验签（HMAC 系列，全部使用 WebCrypto 在本地计算）
      ========================================================================== */
+
+  const JWT_HMAC_ALGORITHMS = { HS256: 'SHA-256', HS384: 'SHA-384', HS512: 'SHA-512' };
+
+  function jwtHmacKey(alg, secret, usages) {
+    return crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: JWT_HMAC_ALGORITHMS[alg] },
+      false,
+      usages
+    );
+  }
+
+  async function jwtSignHmac(alg, secret, data) {
+    const key = await jwtHmacKey(alg, secret, ['sign']);
+    const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+    return T.bytesToBase64(new Uint8Array(signature), true);
+  }
+
+  async function jwtVerifyHmac(alg, secret, data, signaturePart) {
+    const key = await jwtHmacKey(alg, secret, ['verify']);
+    let signature;
+    try {
+      signature = T.base64ToBytes(signaturePart);
+    } catch (_) {
+      return false;
+    }
+    return crypto.subtle.verify('HMAC', key, signature, new TextEncoder().encode(data));
+  }
 
   T.renderers.jwt = function renderJwt(root, ctx) {
     const context = ctx || {};
 
     root.innerHTML = `
       <div class="stack">
-        <section class="card">
-          <div class="card-head">
-            <div class="card-heading"><span class="card-icon">JWT</span><h2>JWT Token</h2></div>
-            <div class="card-actions">
-              <button class="btn btn-sm" type="button" id="jwt-sample">示例</button>
-              <button class="btn btn-sm" type="button" id="jwt-clear">清空</button>
-            </div>
-          </div>
-          <div class="card-body">
-            <textarea id="jwt-input" class="code-area wrap" spellcheck="false" placeholder="粘贴 JWT，例如：eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.…"></textarea>
-            <div class="status" id="jwt-status"></div>
-          </div>
-        </section>
+        <div class="tabs" role="tablist">
+          <button class="tab active" type="button" data-tab="decode" role="tab" aria-selected="true">解析 Token</button>
+          <button class="tab" type="button" data-tab="sign" role="tab" aria-selected="false">签发 Token</button>
+          <button class="tab" type="button" data-tab="verify" role="tab" aria-selected="false">验证签名</button>
+        </div>
 
-        <div id="jwt-result" hidden>
-          <div class="jwt-summary" id="jwt-summary"></div>
-
-          <div class="tool-grid">
-            <section class="card">
-              <div class="card-head">
-                <div class="card-heading"><span class="card-icon">H</span><h2>Header</h2></div>
-                <button class="btn btn-sm" type="button" data-copy="jwt-header">复制</button>
-              </div>
-              <div class="card-body">
-                <pre class="json-pre" id="jwt-header"></pre>
-              </div>
-            </section>
-
-            <section class="card">
-              <div class="card-head">
-                <div class="card-heading"><span class="card-icon">P</span><h2>Payload</h2></div>
-                <button class="btn btn-sm" type="button" data-copy="jwt-payload">复制</button>
-              </div>
-              <div class="card-body">
-                <pre class="json-pre" id="jwt-payload"></pre>
-              </div>
-            </section>
-          </div>
-
+        <div data-panel="decode" class="stack">
           <section class="card">
             <div class="card-head">
-              <div class="card-heading"><span class="card-icon">CL</span><h2>声明与时间</h2></div>
-              <span class="badge">仅解析，不验证签名</span>
+              <div class="card-heading"><span class="card-icon">JWT</span><h2>JWT Token</h2></div>
+              <div class="card-actions">
+                <button class="btn btn-sm" type="button" id="jwt-sample">示例</button>
+                <button class="btn btn-sm" type="button" id="jwt-clear">清空</button>
+              </div>
             </div>
             <div class="card-body">
-              <div class="claims-table" id="jwt-claims"></div>
+              <textarea id="jwt-input" class="code-area wrap" spellcheck="false" placeholder="粘贴 JWT，例如：eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.…"></textarea>
+              <div class="status" id="jwt-status"></div>
             </div>
           </section>
+
+          <div id="jwt-result" hidden>
+            <div class="jwt-summary" id="jwt-summary"></div>
+
+            <div class="tool-grid">
+              <section class="card">
+                <div class="card-head">
+                  <div class="card-heading"><span class="card-icon">H</span><h2>Header</h2></div>
+                  <button class="btn btn-sm" type="button" data-copy="jwt-header">复制</button>
+                </div>
+                <div class="card-body">
+                  <pre class="json-pre" id="jwt-header"></pre>
+                </div>
+              </section>
+
+              <section class="card">
+                <div class="card-head">
+                  <div class="card-heading"><span class="card-icon">P</span><h2>Payload</h2></div>
+                  <button class="btn btn-sm" type="button" data-copy="jwt-payload">复制</button>
+                </div>
+                <div class="card-body">
+                  <pre class="json-pre" id="jwt-payload"></pre>
+                </div>
+              </section>
+            </div>
+
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">CL</span><h2>声明与时间</h2></div>
+                <span class="badge">解码仅展示内容，验签请切换到「验证签名」</span>
+              </div>
+              <div class="card-body">
+                <div class="claims-table" id="jwt-claims"></div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div data-panel="sign" hidden>
+          <div class="tool-grid tool-grid-wide">
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">H</span><h2>Header 与 Payload</h2></div>
+                <div class="card-actions"><button class="btn btn-sm" type="button" id="jwt-sign-sample">示例</button></div>
+              </div>
+              <div class="card-body">
+                <label class="field">
+                  <span class="field-label">Header（JSON）</span>
+                  <textarea id="jwt-sign-header" class="code-area" spellcheck="false">{"alg":"HS256","typ":"JWT"}</textarea>
+                </label>
+                <label class="field">
+                  <span class="field-label">Payload（JSON）</span>
+                  <textarea id="jwt-sign-payload" class="code-area" spellcheck="false">{"sub":"1234567890","name":"CTool User","iat":1516239022,"exp":4102444800}</textarea>
+                </label>
+                <div class="form-grid">
+                  <label class="field">
+                    <span class="field-label">签名算法</span>
+                    <select class="select" id="jwt-sign-alg">
+                      <option value="HS256">HS256</option>
+                      <option value="HS384">HS384</option>
+                      <option value="HS512">HS512</option>
+                      <option value="none">none（无签名）</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">密钥（Secret）</span>
+                    <input class="input" id="jwt-sign-secret" type="text" spellcheck="false" placeholder="输入 HMAC 密钥">
+                  </label>
+                </div>
+                <div class="notice">none 算法仅用于本地测试与 CTF 练习，切勿用于生产环境。</div>
+                <div class="status" id="jwt-sign-status"></div>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-primary" type="button" id="jwt-sign-run">签发 Token</button>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">JWT</span><h2>生成的 Token</h2></div>
+                <div class="card-actions"><button class="btn btn-sm" type="button" data-copy="jwt-sign-output">复制</button></div>
+              </div>
+              <div class="card-body">
+                <textarea id="jwt-sign-output" class="code-area output-area wrap" readonly spellcheck="false" placeholder="签发结果会显示在这里"></textarea>
+                <div class="meta-line" id="jwt-sign-meta"></div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div data-panel="verify" hidden>
+          <div class="tool-grid tool-grid-wide">
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">CHK</span><h2>待验证的 Token</h2></div>
+                <div class="card-actions"><button class="btn btn-sm" type="button" id="jwt-verify-sample">用签发结果</button></div>
+              </div>
+              <div class="card-body">
+                <textarea id="jwt-verify-input" class="code-area wrap" spellcheck="false" placeholder="粘贴要验证的 JWT…"></textarea>
+                <label class="field">
+                  <span class="field-label">密钥（Secret）</span>
+                  <input class="input" id="jwt-verify-secret" type="text" spellcheck="false" placeholder="输入签发时使用的密钥">
+                </label>
+                <div class="status" id="jwt-verify-status"></div>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-primary" type="button" id="jwt-verify-run">验证签名</button>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">OUT</span><h2>验证结果</h2></div>
+              </div>
+              <div class="card-body">
+                <div class="result-list" id="jwt-verify-result">
+                  <div class="empty-state">输入 Token 与密钥后点击“验证签名”。</div>
+                </div>
+                <div class="notice">支持 HS256 / HS384 / HS512 与 none；RS / ES 等非对称算法暂不支持。</div>
+              </div>
+            </section>
+          </div>
         </div>
       </div>
     `;
@@ -589,7 +773,137 @@
 
     bindCopyButtons(root);
     reset();
-    if (context.text) {
+
+    /* 签发与验签 */
+    const signHeader = $('#jwt-sign-header', root);
+    const signPayload = $('#jwt-sign-payload', root);
+    const signAlg = $('#jwt-sign-alg', root);
+    const signSecret = $('#jwt-sign-secret', root);
+    const signOutput = $('#jwt-sign-output', root);
+    const signStatus = $('#jwt-sign-status', root);
+    const signMeta = $('#jwt-sign-meta', root);
+    const verifyInput = $('#jwt-verify-input', root);
+    const verifySecret = $('#jwt-verify-secret', root);
+    const verifyStatus = $('#jwt-verify-status', root);
+    const verifyResult = $('#jwt-verify-result', root);
+
+    async function signToken() {
+      let header;
+      let payload;
+      try {
+        header = JSON.parse(signHeader.value);
+        payload = JSON.parse(signPayload.value);
+      } catch (_) {
+        setStatus(signStatus, T.t('Header 或 Payload 不是有效的 JSON'), 'error');
+        return;
+      }
+      if (!header || typeof header !== 'object' || Array.isArray(header) || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        setStatus(signStatus, T.t('Header 与 Payload 必须是 JSON 对象'), 'error');
+        return;
+      }
+      const alg = signAlg.value;
+      header.alg = alg;
+      if (!header.typ) header.typ = 'JWT';
+      const head = T.utf8ToBase64(JSON.stringify(header), true);
+      const body = T.utf8ToBase64(JSON.stringify(payload), true);
+      const data = head + '.' + body;
+      let signature = '';
+      if (alg !== 'none') {
+        if (!signSecret.value) {
+          setStatus(signStatus, T.t('请先填写 HMAC 密钥'), 'warn');
+          return;
+        }
+        try {
+          signature = await jwtSignHmac(alg, signSecret.value, data);
+        } catch (error) {
+          setStatus(signStatus, T.t('签名失败：') + (error.message || ''), 'error');
+          return;
+        }
+      }
+      signOutput.value = data + '.' + signature;
+      signMeta.textContent = alg + ' · ' + signOutput.value.length + ' ' + T.t('字符');
+      setStatus(signStatus, '✓ ' + T.t('签发成功'), 'ok');
+      verifyInput.value = signOutput.value;
+      verifySecret.value = signSecret.value;
+    }
+
+    function verifyRow(label, value) {
+      return '<div class="result-row"><div class="result-label">' + escapeHtml(label) + '</div><code class="result-value wrap">' + escapeHtml(value) + '</code></div>';
+    }
+
+    async function verifyToken() {
+      const token = verifyInput.value.trim().replace(/\s+/g, '');
+      if (!token) {
+        setStatus(verifyStatus, T.t('请输入要验证的 JWT'), 'warn');
+        return;
+      }
+      const parts = token.split('.');
+      if (parts.length !== 3) {
+        setStatus(verifyStatus, T.t('JWT 应该由三段 Base64URL 组成'), 'error');
+        return;
+      }
+      let header;
+      try {
+        header = JSON.parse(T.base64UrlDecodeUtf8(parts[0]));
+      } catch (_) {
+        setStatus(verifyStatus, T.t('无法解析 Header'), 'error');
+        return;
+      }
+      const alg = header && header.alg;
+      const rows = [verifyRow(T.t('算法'), String(alg || T.t('未声明')))];
+      if (alg === 'none') {
+        rows.push(verifyRow(T.t('验证结果'), T.t('无签名（不提供完整性保护）')));
+        verifyResult.innerHTML = rows.join('');
+        setStatus(verifyStatus, T.t('该 Token 使用 none 算法，没有签名可验证'), 'warn');
+        return;
+      }
+      if (!JWT_HMAC_ALGORITHMS[alg]) {
+        setStatus(verifyStatus, T.t('暂不支持该算法：') + String(alg || ''), 'error');
+        return;
+      }
+      if (!verifySecret.value) {
+        setStatus(verifyStatus, T.t('请先填写 HMAC 密钥'), 'warn');
+        return;
+      }
+      let valid = false;
+      try {
+        valid = await jwtVerifyHmac(alg, verifySecret.value, parts[0] + '.' + parts[1], parts[2]);
+      } catch (_) {
+        valid = false;
+      }
+      rows.push(verifyRow(T.t('签名'), parts[2] ? parts[2].slice(0, 24) + '…' : T.t('空')));
+      rows.push(verifyRow(T.t('验证结果'), valid ? T.t('签名有效') : T.t('签名无效或密钥不匹配')));
+      verifyResult.innerHTML = rows.join('');
+      setStatus(verifyStatus, valid ? '✓ ' + T.t('签名有效') : T.t('签名无效或密钥不匹配'), valid ? 'ok' : 'error');
+    }
+
+    $('#jwt-sign-run', root).addEventListener('click', signToken);
+    $('#jwt-sign-sample', root).addEventListener('click', () => {
+      const now = Math.floor(Date.now() / 1000);
+      signHeader.value = JSON.stringify({ alg: 'HS256', typ: 'JWT' }, null, 2);
+      signPayload.value = JSON.stringify({ sub: '1234567890', name: 'CTool User', iat: now, exp: now + 3600 }, null, 2);
+      signAlg.value = 'HS256';
+      setStatus(signStatus, T.t('已填入示例，填写密钥后即可签发'), 'info');
+    });
+    $('#jwt-verify-run', root).addEventListener('click', verifyToken);
+    $('#jwt-verify-sample', root).addEventListener('click', () => {
+      if (!signOutput.value) {
+        showToast(T.t('请先在「签发 Token」中生成一个 Token'), 'warn');
+        return;
+      }
+      verifyInput.value = signOutput.value;
+      verifySecret.value = signSecret.value;
+    });
+    bindCtrlEnter(verifyInput, verifyToken);
+
+    const jwtTabs = setupTabs(root);
+    if (context.action === 'verify') {
+      jwtTabs.activate('verify');
+      if (context.text) verifyInput.value = context.text;
+    } else if (context.action === 'sign') {
+      jwtTabs.activate('sign');
+      if (context.text) signPayload.value = context.text;
+    } else if (context.text) {
       input.value = context.text;
       decode();
     }

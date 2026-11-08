@@ -7,7 +7,7 @@
 
   const COMPACT_MODE = new URLSearchParams(location.search).get('mode') === 'compact';
   const IN_IFRAME = window.parent && window.parent !== window;
-  const CATEGORY_ORDER = ['工作台', '数据处理', '编码转换', '开发工具', '转换计算', '网页下载', '内容办公', 'AI 助手'];
+  const CATEGORY_ORDER = ['工作台', '数据处理', '编码转换', '开发工具', '转换计算', '网页下载', '内容办公', 'AI 助手', '关于与支持'];
   const FAVORITES_KEY = 'favorites';
   const PROFESSION_KEY = 'profession';
 
@@ -65,16 +65,16 @@
       name: 'JWT 解析',
       icon: 'JWT',
       category: '编码转换',
-      description: '解析 JWT Header 与 Payload，查看声明和过期状态。',
-      keywords: 'jwt token json web token 解析 header payload'
+      description: '解析 JWT Header 与 Payload，支持 HS256/384/512 签发、验签与 none 调试。',
+      keywords: 'jwt token json web token 解析 签发 验签 签名 header payload hmac hs256 none'
     },
     {
       id: 'hash',
       name: '哈希计算',
       icon: '#',
       category: '开发工具',
-      description: '一次性计算 MD5、SHA-1、SHA-256、SHA-384、SHA-512。',
-      keywords: 'hash 哈希 md5 sha1 sha256 sha512 摘要 校验'
+      description: '计算 MD5、SHA-1/256/384/512，并支持 HMAC 与 CRC32。',
+      keywords: 'hash 哈希 md5 sha1 sha256 sha512 摘要 校验 hmac crc32 签名'
     },
     {
       id: 'timestamp',
@@ -125,36 +125,13 @@
       keywords: '单位 换算 长度 重量 温度 面积 数据 时间 速度 体积'
     },
     {
-      id: 'images',
-      name: '图片下载',
-      icon: 'IMG',
+      id: 'download',
+      name: '网页下载',
+      icon: '↓',
       category: '网页下载',
-      description: '扫描网页中的图片、背景图、海报与画布，筛选后批量下载。',
-      keywords: '图片 image img 下载 抓取 背景图 海报 画布 批量 网页'
-    },
-    {
-      id: 'docs',
-      name: '文档下载',
-      icon: 'DOC',
-      category: '网页下载',
-      description: '提取网页中的 PDF、Office、电子书、压缩包等文件直链。',
-      keywords: '文档 文件 下载 pdf word excel ppt zip 压缩包 附件 电子书'
-    },
-    {
-      id: 'tables',
-      name: '表格下载',
-      icon: 'TBL',
-      category: '网页下载',
-      description: '识别网页中的 HTML 表格，预览并批量导出为 CSV。',
-      keywords: '表格 table csv excel 导出 下载 网页 数据'
-    },
-    {
-      id: 'media',
-      name: '媒体下载',
-      icon: 'MED',
-      category: '网页下载',
-      description: '提取网页中的视频、音频和流媒体直链，批量下载。',
-      keywords: '视频 音频 media video audio mp4 mp3 m3u8 下载 网页'
+      description: '扫描网页中的图片、文档、表格、媒体等所有资源，按类型分类复选框勾选后批量下载。',
+      keywords: '下载 图片 文档 表格 媒体 视频 音频 pdf zip 抓取 批量 网页 资源',
+      keywordsEn: 'download image document table media video audio pdf zip scrape batch web resources'
     },
     {
       id: 'jsoncsv',
@@ -179,9 +156,9 @@
       name: 'URL 解析器',
       icon: '?=',
       category: '开发工具',
-      description: '拆解 URL 的协议、主机、路径、查询参数与锚点。',
-      keywords: 'url uri 解析 参数 query 查询 主机 路径',
-      keywordsEn: 'url uri parse query parameters host path fragment'
+      description: '拆解 URL，并可编辑、增删查询参数，重建与复制 URL。',
+      keywords: 'url uri 解析 参数 query 查询 主机 路径 编辑 重建',
+      keywordsEn: 'url uri parse query parameters host path fragment edit rebuild'
     },
     {
       id: 'diff',
@@ -215,18 +192,18 @@
       name: 'Markdown 预览',
       icon: 'MD',
       category: '内容办公',
-      description: '本地渲染 Markdown，支持标题、列表、代码、表格与链接。',
-      keywords: 'markdown md 预览 渲染 文档 html',
-      keywordsEn: 'markdown md preview render document html'
+      description: '本地渲染 Markdown，可导出 HTML 与 .md 文件。',
+      keywords: 'markdown md 预览 渲染 文档 html 导出',
+      keywordsEn: 'markdown md preview render document html export'
     },
     {
       id: 'qrcode',
       name: '二维码生成',
       icon: 'QR',
       category: '内容办公',
-      description: '把文本或链接生成可下载的二维码图片，完全离线。',
-      keywords: '二维码 qr code 生成 图片 链接',
-      keywordsEn: 'qr code generate image link'
+      description: '生成可下载的 PNG / SVG 二维码，也能识别图片中的二维码。',
+      keywords: '二维码 qr code 生成 识别 解码 图片 链接',
+      keywordsEn: 'qr code generate decode read scan image link'
     },
     {
       id: 'datecalc',
@@ -296,9 +273,9 @@
       name: '图片转 Base64',
       icon: 'B64',
       category: '编码转换',
-      description: '把图片转换为 Data URL，复制为 CSS 或 HTML 片段。',
-      keywords: '图片 base64 data url css html 内联 编码',
-      keywordsEn: 'image base64 data url css html inline encode'
+      description: '图片与 Base64 / Data URL 双向转换，支持预览与下载还原的图片。',
+      keywords: '图片 base64 data url css html 内联 编码 解码 还原 预览',
+      keywordsEn: 'image base64 data url css html inline encode decode restore preview'
     },
     {
       id: 'httpref',
@@ -326,6 +303,15 @@
       description: '按职业推荐工具、收藏常用工具，并一键运行自动化工作流。',
       keywords: '工作台 推荐 收藏 职业 自动化 工作流',
       keywordsEn: 'workspace recommend favorite profession automation workflow'
+    },
+    {
+      id: 'sponsor',
+      name: '赞赏支持',
+      icon: '♥',
+      category: '关于与支持',
+      description: '微信 / 支付宝赞赏码、底价接活开发说明与联系方式（邮箱 / QQ）。',
+      keywords: '赞赏 赞助 支持 打赏 微信 支付宝 收款码 二维码 接活 外包 开发 定制 联系方式 邮箱 QQ 1399838678',
+      keywordsEn: 'sponsor donate support wechat alipay qr code freelance development custom contact email qq'
     }
   ];
 
@@ -422,6 +408,7 @@
     const next = Array.from(new Set((Array.isArray(list) ? list : []).filter((id) => TOOL_MAP.has(id))));
     setPref(FAVORITES_KEY, next);
     renderNav();
+    if (COMPACT_MODE) renderCompactPicker();
     try {
       window.dispatchEvent(new CustomEvent('ctool:favoriteschange', { detail: { favorites: next } }));
     } catch (_) {
@@ -453,24 +440,80 @@
   function renderCompactPicker() {
     const nav = $('#compact-nav');
     if (!nav) return;
-    nav.innerHTML = CATEGORY_ORDER.map((category) => {
-      const tools = TOOL_DEFS.filter((tool) => tool.category === category);
+    const favorites = getFavorites();
+
+    // 工作台永远在最前面
+    const workspace = TOOL_MAP.get('workspace');
+
+    let html = '';
+
+    // 顶部标题 + 搜索
+    html += '<div class="compact-header">';
+    html += '<div class="compact-title">工具·万能工具箱</div>';
+    html += '<div class="compact-search">';
+    html += '<input class="compact-search-input" id="compact-search-input" type="search" placeholder="搜索工具…" autocomplete="off" aria-label="搜索工具">';
+    html += '</div>';
+    html += '</div>';
+
+    // 工作台（始终第一个）
+    if (workspace) {
+      html += '<div class="compact-tool-group">';
+      const isFav = favorites.indexOf('workspace') !== -1;
+      html += '<button class="compact-tool-btn' + (currentToolId === 'workspace' ? ' active' : '') + (isFav ? ' fav' : '') + '" type="button" data-tool="workspace" data-keywords="' + escapeHtml((T.t(workspace.name) + ' ' + T.t(workspace.category) + ' ' + (workspace.keywords || '')).toLowerCase()) + '" title="' + escapeHtml(T.t(workspace.description)) + '">';
+      html += '<span class="compact-tool-star">' + (isFav ? '★' : '☆') + '</span>';
+      html += '<span class="compact-tool-label">' + escapeHtml(T.t(workspace.name)) + '</span>';
+      html += '</button>';
+      html += '</div>';
+    }
+
+    // 其他分类下的工具（不包括工作台）
+    CATEGORY_ORDER.filter((c) => c !== '工作台').forEach((category) => {
+      const tools = TOOL_DEFS.filter((tool) => tool.category === category && tool.id !== 'workspace');
       if (!tools.length) return '';
-      return (
-        '<div class="compact-category">' +
-          '<div class="compact-category-title">' + escapeHtml(T.t(category)) + '</div>' +
-          '<div class="compact-tool-list">' +
-          tools.map((tool) =>
-            '<button class="compact-tool-btn' + (currentToolId === tool.id ? ' active' : '') + '" type="button" data-tool="' + escapeHtml(tool.id) + '" title="' + escapeHtml(T.t(tool.description)) + '">' +
-            '<span class="compact-tool-icon" aria-hidden="true">' + escapeHtml(tool.icon) + '</span>' +
-            '<span class="compact-tool-label">' + escapeHtml(T.t(tool.name)) + '</span>' +
-            '</button>'
-          ).join('') +
-          '</div>' +
-        '</div>'
-      );
-    }).join('');
+      html += '<div class="compact-category">';
+      html += '<div class="compact-category-title">' + escapeHtml(T.t(category)) + '</div>';
+      html += '<div class="compact-tool-list">';
+      tools.forEach((tool) => {
+        const isFav = favorites.indexOf(tool.id) !== -1;
+        html += '<button class="compact-tool-btn' + (currentToolId === tool.id ? ' active' : '') + (isFav ? ' fav' : '') + '" type="button" data-tool="' + escapeHtml(tool.id) + '" data-keywords="' + escapeHtml((T.t(tool.name) + ' ' + category + ' ' + (tool.keywords || '')).toLowerCase()) + '" title="' + escapeHtml(T.t(tool.description)) + '">';
+        html += '<span class="compact-tool-star">' + (isFav ? '★' : '☆') + '</span>';
+        html += '<span class="compact-tool-label">' + escapeHtml(T.t(tool.name)) + '</span>';
+        html += '</button>';
+      });
+      html += '</div>';
+      html += '</div>';
+    });
+
+    nav.innerHTML = html;
   }
+
+  /* 全局搜索过滤函数（由 compact 工具栏搜索框的 oninput 调用） */
+  window._ctoolFilterCompact = function (value) {
+    const q = (value || '').trim().toLowerCase();
+    document.querySelectorAll('#compact-nav .compact-tool-btn').forEach((btn) => {
+      const kw = btn.getAttribute('data-keywords') || '';
+      const match = !q || kw.includes(q);
+      btn.hidden = !match;
+      btn.style.display = match ? '' : 'none';
+    });
+    document.querySelectorAll('#compact-nav .compact-category').forEach((cat) => {
+      const list = cat.querySelector('.compact-tool-list');
+      const title = cat.querySelector('.compact-category-title');
+      let visible = 0;
+      if (list) {
+        list.querySelectorAll('.compact-tool-btn').forEach((btn) => {
+          if (!btn.hidden) visible += 1;
+        });
+      }
+      if (title) title.hidden = visible === 0;
+      cat.hidden = visible === 0;
+    });
+    const workGroup = document.querySelector('#compact-nav .compact-tool-group');
+    if (workGroup) {
+      const btn = workGroup.querySelector('.compact-tool-btn');
+      workGroup.hidden = btn && btn.hidden;
+    }
+  };
 
   function readCurrentToolText() {
     const content = $('#tool-content');
@@ -541,6 +584,36 @@
         if (!btn) return;
         const text = readCurrentToolText();
         selectTool(btn.getAttribute('data-tool'), text ? { text: text } : undefined);
+      });
+    }
+
+    const search = document.querySelector('#compact-search-input');
+    if (search) {
+      search.addEventListener('input', (event) => {
+        const q = (event.target.value || '').trim().toLowerCase();
+        document.querySelectorAll('#compact-nav .compact-tool-btn').forEach((btn) => {
+          const kw = btn.getAttribute('data-keywords') || '';
+          const match = !q || kw.includes(q);
+          btn.hidden = !match;
+          btn.style.display = match ? '' : 'none';
+        });
+        document.querySelectorAll('#compact-nav .compact-category').forEach((cat) => {
+          const list = cat.querySelector('.compact-tool-list');
+          const title = cat.querySelector('.compact-category-title');
+          let visible = 0;
+          if (list) {
+            list.querySelectorAll('.compact-tool-btn').forEach((btn) => {
+              if (!btn.hidden) visible += 1;
+            });
+          }
+          if (title) title.hidden = visible === 0;
+          cat.hidden = visible === 0;
+        });
+        const workGroup = document.querySelector('#compact-nav .compact-tool-group');
+        if (workGroup) {
+          const btn = workGroup.querySelector('.compact-tool-btn');
+          workGroup.hidden = btn && btn.hidden;
+        }
       });
     }
 
@@ -959,6 +1032,12 @@
       document.body.classList.add('sidebar-open');
     }
     await applyPendingFromStorage();
+
+    // 每日一次的赞赏提示：稍作延迟，让右键 / 菜单带入的任务先完成，避免弹窗打断操作。
+    setTimeout(function () {
+      if (lastTaskContext) return;
+      if (typeof T.maybeShowSponsorNotice === 'function') T.maybeShowSponsorNotice();
+    }, 800);
   }
 
   if (document.readyState === 'loading') {

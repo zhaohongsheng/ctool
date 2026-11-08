@@ -23,12 +23,12 @@
   const RECOMMENDATIONS = {
     developer: ['json', 'xml', 'sql', 'jsoncsv', 'regex', 'hash', 'filehash', 'jwt', 'base64', 'urlparse', 'diff', 'aes', 'cron', 'mock', 'httpref', 'unicode', 'qrcode'],
     product: ['text', 'markdown', 'qrcode', 'imageconv', 'imgbase64', 'datecalc', 'diff', 'jsoncsv', 'urlparse', 'lorem', 'httpref', 'ai'],
-    design: ['imageconv', 'imgbase64', 'qrcode', 'color', 'images', 'markdown', 'lorem', 'ai'],
+    design: ['imageconv', 'imgbase64', 'qrcode', 'color', 'download', 'markdown', 'lorem', 'ai'],
     finance: ['jsoncsv', 'text', 'datecalc', 'mock', 'hash', 'filehash', 'imgbase64', 'markdown', 'sql', 'xml'],
     hr: ['text', 'markdown', 'datecalc', 'jsoncsv', 'mock', 'qrcode', 'imageconv', 'filehash', 'lorem'],
     student: ['markdown', 'text', 'qrcode', 'datecalc', 'imageconv', 'diff', 'json', 'ai', 'lorem', 'unicode'],
     teacher: ['markdown', 'text', 'qrcode', 'imageconv', 'datecalc', 'diff', 'lorem', 'ai', 'xml'],
-    ecommerce: ['images', 'tables', 'text', 'qrcode', 'imageconv', 'imgbase64', 'jsoncsv', 'mock', 'datecalc', 'lorem'],
+    ecommerce: ['download', 'text', 'qrcode', 'imageconv', 'imgbase64', 'jsoncsv', 'mock', 'datecalc', 'lorem'],
     healthcare: ['text', 'markdown', 'datecalc', 'hash', 'filehash', 'imgbase64', 'qrcode', 'ai'],
     legal: ['text', 'diff', 'markdown', 'datecalc', 'filehash', 'hash', 'xml', 'ai'],
     engineer: ['base', 'unit', 'timestamp', 'hash', 'filehash', 'xml', 'json', 'color', 'sql', 'httpref'],
@@ -58,20 +58,12 @@
       action: '运行'
     },
     {
-      id: 'tables',
-      icon: 'TBL',
-      name: '扫描网页表格',
-      description: '识别当前网页的表格并批量导出 CSV。',
+      id: 'download',
+      icon: '↓',
+      name: '网页资源下载',
+      description: '扫描网页中的图片、文档、表格与媒体，勾选后下载或打包 ZIP。',
       action: '打开',
-      tool: 'tables'
-    },
-    {
-      id: 'images',
-      icon: 'IMG',
-      name: '批量下载图片',
-      description: '扫描当前网页图片并批量下载。',
-      action: '打开',
-      tool: 'images'
+      tool: 'download'
     },
     {
       id: 'datecalc',

@@ -178,7 +178,7 @@
 
     if (context.text) {
       input.value = context.text;
-      run('format');
+      run(context.action === 'minify' ? 'minify' : 'format');
     }
   };
 
@@ -660,6 +660,10 @@
     bindCtrlEnter(input, convert);
     bindCopyButtons(root);
 
-    if (context.text) input.value = context.text;
+    if (context.text) {
+      input.value = context.text;
+      if (context.action === 'encode' || context.action === 'decode') tabs.activate(context.action);
+      convert();
+    }
   };
 })();

@@ -14,7 +14,18 @@ const CONTEXT_MENUS = [
   { id: 'json-format', title: 'JSON 格式化', tool: 'json', action: 'format' },
   { id: 'text-stats', title: '文本统计', tool: 'text', action: 'stats' },
   { id: 'hash-text', title: '计算哈希', tool: 'hash', action: 'hash' },
-  { id: 'decode-jwt', title: '解析 JWT', tool: 'jwt', action: 'decode' }
+  { id: 'decode-jwt', title: '解析 JWT', tool: 'jwt', action: 'decode' },
+  { id: 'verify-jwt', title: '验证 JWT 签名', tool: 'jwt', action: 'verify' },
+  { id: 'html-encode', title: 'HTML 实体编码', tool: 'html', action: 'encode' },
+  { id: 'html-decode', title: 'HTML 实体解码', tool: 'html', action: 'decode' },
+  { id: 'unicode-encode', title: 'Unicode 转义', tool: 'unicode', action: 'encode' },
+  { id: 'unicode-decode', title: 'Unicode 还原', tool: 'unicode', action: 'decode' },
+  { id: 'json-minify', title: 'JSON 压缩', tool: 'json', action: 'minify' },
+  { id: 'xml-format', title: 'XML 格式化', tool: 'xml', action: 'format' },
+  { id: 'sql-format', title: 'SQL 格式化', tool: 'sql', action: 'format' },
+  { id: 'qrcode-generate', title: '生成二维码', tool: 'qrcode', action: 'generate' },
+  { id: 'url-parse', title: '解析 URL', tool: 'urlparse', action: 'parse' },
+  { id: 'markdown-preview', title: 'Markdown 预览', tool: 'markdown', action: 'preview' }
 ];
 
 function createContextMenus() {

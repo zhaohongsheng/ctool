@@ -566,7 +566,9 @@
      URL 解析器
      ========================================================================== */
 
-  T.renderers.urlparse = function renderUrlParse(root) {
+  T.renderers.urlparse = function renderUrlParse(root, ctx) {
+    const context = ctx || {};
+    let currentUrl = null;
     root.innerHTML = `
       <div class="stack">
         <section class="card">
@@ -611,6 +613,12 @@
               <div class="urlp-params" id="urlp-params">
                 <div class="empty-state">解析后会显示查询参数与解码结果。</div>
               </div>
+              <div class="urlp-edit-actions">
+                <button class="btn btn-sm" type="button" id="urlp-add">添加参数</button>
+                <button class="btn btn-sm" type="button" id="urlp-apply">重建 URL</button>
+                <button class="btn btn-sm" type="button" id="urlp-copy-url">复制 URL</button>
+              </div>
+              <div class="field-hint">可直接修改参数名与值（填写解码后的值），重建时会自动编码。</div>
               <pre class="urlp-output" id="urlp-output" data-no-i18n hidden></pre>
             </div>
           </section>
@@ -642,6 +650,7 @@
           throw new Error('仅支持带协议的标准 URL');
         }
       } catch (error) {
+        currentUrl = null;
         parts.innerHTML = '<div class="empty-state">无法解析该 URL。</div>';
         params.innerHTML = '<div class="empty-state">无法解析该 URL。</div>';
         rawOutput.textContent = '';
@@ -650,6 +659,7 @@
         return;
       }
 
+      currentUrl = url;
       const paramList = Array.from(url.searchParams.entries());
       parts.innerHTML = [
         row('协议', url.protocol.replace(/:$/, '')),
@@ -672,10 +682,10 @@
               decoded = paramValue;
             }
             return `
-              <div class="urlp-param">
-                <code class="urlp-key">${escapeHtml(key)}</code>
-                <code class="urlp-value">${escapeHtml(decoded === paramValue ? paramValue : decoded + '  ←  ' + paramValue)}</code>
-                <button class="copy-mini" type="button" data-urlp-copy="${escapeHtml(paramValue)}">复制</button>
+              <div class="urlp-param urlp-edit-row" data-urlp-row>
+                <input class="input urlp-edit-key" type="text" spellcheck="false" aria-label="参数名" value="${escapeHtml(key)}">
+                <input class="input urlp-edit-value" type="text" spellcheck="false" aria-label="参数值" value="${escapeHtml(decoded)}">
+                <button class="copy-mini" type="button" data-urlp-remove>删除</button>
               </div>
             `;
           }).join('') + '</div>'
@@ -699,6 +709,7 @@
     });
     $('#urlp-clear', root).addEventListener('click', () => {
       input.value = '';
+      currentUrl = null;
       parts.innerHTML = '<div class="empty-state">解析后会显示 URL 的各个组成部分。</div>';
       params.innerHTML = '<div class="empty-state">解析后会显示查询参数与解码结果。</div>';
       rawOutput.textContent = '';
@@ -707,10 +718,56 @@
       input.focus();
     });
     params.addEventListener('click', (event) => {
-      const button = event.target.closest('[data-urlp-copy]');
-      if (button) copyText(button.getAttribute('data-urlp-copy'));
+      const remove = event.target.closest('[data-urlp-remove]');
+      if (remove) {
+        const row = remove.closest('[data-urlp-row]');
+        if (row) row.remove();
+      }
+    });
+
+    function addParamRow(key, value) {
+      if (!$('.urlp-table', params)) params.innerHTML = '<div class="urlp-table"></div>';
+      const row = document.createElement('div');
+      row.className = 'urlp-param urlp-edit-row';
+      row.setAttribute('data-urlp-row', '');
+      row.innerHTML = '<input class="input urlp-edit-key" type="text" spellcheck="false" aria-label="' + T.t('参数名') + '" value="' + escapeHtml(key || '') + '">' +
+        '<input class="input urlp-edit-value" type="text" spellcheck="false" aria-label="' + T.t('参数值') + '" value="' + escapeHtml(value || '') + '">' +
+        '<button class="copy-mini" type="button" data-urlp-remove>' + T.t('删除') + '</button>';
+      $('.urlp-table', params).appendChild(row);
+      $('.urlp-edit-key', row).focus();
+    }
+
+    function rebuildUrl() {
+      if (!currentUrl) {
+        setStatus(status, T.t('请先解析一个 URL'), 'warn');
+        return;
+      }
+      const next = new URL(currentUrl.href);
+      next.search = '';
+      $$('[data-urlp-row]', params).forEach((row) => {
+        const key = $('.urlp-edit-key', row).value.trim();
+        const value = $('.urlp-edit-value', row).value;
+        if (key) next.searchParams.append(key, value);
+      });
+      input.value = next.href;
+      run();
+      setStatus(status, '✓ ' + T.t('URL 已重建'), 'ok');
+    }
+
+    $('#urlp-add', root).addEventListener('click', () => addParamRow('', ''));
+    $('#urlp-apply', root).addEventListener('click', rebuildUrl);
+    $('#urlp-copy-url', root).addEventListener('click', () => {
+      if (!input.value.trim()) {
+        showToast(T.t('还没有可复制的 URL'), 'warn');
+        return;
+      }
+      copyText(input.value.trim());
     });
     bindCopyButtons(root);
+    if (context.text) {
+      input.value = context.text;
+      run();
+    }
   };
 
   /* ==========================================================================
@@ -1396,7 +1453,8 @@
     return output.join('\n');
   }
 
-  T.renderers.markdown = function renderMarkdown(root) {
+  T.renderers.markdown = function renderMarkdown(root, ctx) {
+    const context = ctx || {};
     root.innerHTML = `
       <div class="tool-grid tool-grid-wide">
         <section class="card">
@@ -1433,6 +1491,7 @@ console.log('CTool');
           </div>
           <div class="card-foot">
             <button class="btn" type="button" id="md-export">导出 HTML</button>
+            <button class="btn" type="button" id="md-export-md">下载 .md</button>
             <span class="spacer"></span>
             <span class="meta-line" id="md-meta"></span>
           </div>
@@ -1493,7 +1552,15 @@ console.log('CTool');
         '</head><body>' + markdownToHtml(input.value) + '</body></html>';
       downloadText('ctool-markdown.html', html, 'text/html;charset=utf-8');
     });
+    $('#md-export-md', root).addEventListener('click', () => {
+      if (!input.value.trim()) {
+        showToast('还没有可导出的内容', 'warn');
+        return;
+      }
+      downloadText('ctool-markdown.md', input.value, 'text/markdown;charset=utf-8');
+    });
     bindCopyButtons(root);
+    if (context.text) input.value = context.text;
     render();
   };
 
@@ -1501,63 +1568,111 @@ console.log('CTool');
      二维码生成
      ========================================================================== */
 
-  T.renderers.qrcode = function renderQr(root) {
+  T.renderers.qrcode = function renderQr(root, ctx) {
+    const context = ctx || {};
     root.innerHTML = `
-      <div class="tool-grid qr-layout">
-        <section class="card">
-          <div class="card-head">
-            <div class="card-heading"><span class="card-icon">QR</span><h2>二维码内容</h2></div>
-          </div>
-          <div class="card-body">
-            <label class="field">
-              <span class="field-label">输入文本或链接…</span>
-              <textarea class="textarea qr-input" id="qr-input" spellcheck="false" placeholder="https://example.com">https://example.com</textarea>
-            </label>
-            <div class="form-grid">
-              <label class="field">
-                <span class="field-label">尺寸</span>
-                <select class="select" id="qr-size">
-                  <option value="256">256 px</option>
-                  <option value="384">384 px</option>
-                  <option value="512" selected>512 px</option>
-                  <option value="768">768 px</option>
-                  <option value="1024">1024 px</option>
-                </select>
-              </label>
-              <label class="field">
-                <span class="field-label">容错级别</span>
-                <select class="select" id="qr-ecc">
-                  <option value="L">低 (L)</option>
-                  <option value="M" selected>中 (M)</option>
-                  <option value="Q">较高 (Q)</option>
-                  <option value="H">高 (H)</option>
-                </select>
-              </label>
-            </div>
-            <div class="row-between">
-              <span class="field-hint">二维码在本地生成，不会上传内容。</span>
-              <span class="status" id="qr-status"></span>
-            </div>
-          </div>
-          <div class="card-foot">
-            <button class="btn btn-primary" type="button" id="qr-run">生成二维码</button>
-            <button class="btn" type="button" id="qr-png" disabled>下载 PNG</button>
-            <button class="btn" type="button" id="qr-svg" disabled>下载 SVG</button>
-          </div>
-        </section>
+      <div class="stack">
+        <div class="tabs" role="tablist">
+          <button class="tab active" type="button" data-tab="generate" role="tab" aria-selected="true">生成二维码</button>
+          <button class="tab" type="button" data-tab="decode" role="tab" aria-selected="false">识别二维码</button>
+        </div>
 
-        <section class="card">
-          <div class="card-head">
-            <div class="card-heading"><span class="card-icon">IMG</span><h2>预览</h2></div>
-            <div class="card-actions"><span class="badge" id="qr-badge">等待生成</span></div>
+        <div data-panel="generate">
+          <div class="tool-grid qr-layout">
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">QR</span><h2>二维码内容</h2></div>
+              </div>
+              <div class="card-body">
+                <label class="field">
+                  <span class="field-label">输入文本或链接…</span>
+                  <textarea class="textarea qr-input" id="qr-input" spellcheck="false" placeholder="https://example.com">https://example.com</textarea>
+                </label>
+                <div class="form-grid">
+                  <label class="field">
+                    <span class="field-label">尺寸</span>
+                    <select class="select" id="qr-size">
+                      <option value="256">256 px</option>
+                      <option value="384">384 px</option>
+                      <option value="512" selected>512 px</option>
+                      <option value="768">768 px</option>
+                      <option value="1024">1024 px</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">容错级别</span>
+                    <select class="select" id="qr-ecc">
+                      <option value="L">低 (L)</option>
+                      <option value="M" selected>中 (M)</option>
+                      <option value="Q">较高 (Q)</option>
+                      <option value="H">高 (H)</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="row-between">
+                  <span class="field-hint">二维码在本地生成，不会上传内容。</span>
+                  <span class="status" id="qr-status"></span>
+                </div>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-primary" type="button" id="qr-run">生成二维码</button>
+                <button class="btn" type="button" id="qr-png" disabled>下载 PNG</button>
+                <button class="btn" type="button" id="qr-svg" disabled>下载 SVG</button>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">IMG</span><h2>预览</h2></div>
+                <div class="card-actions"><span class="badge" id="qr-badge">等待生成</span></div>
+              </div>
+              <div class="card-body">
+                <div class="qr-preview">
+                  <div class="qr-svg-wrap" id="qr-preview" data-no-i18n></div>
+                  <div class="qr-empty" id="qr-empty">输入内容并点击“生成二维码”。</div>
+                </div>
+              </div>
+            </section>
           </div>
-          <div class="card-body">
-            <div class="qr-preview">
-              <div class="qr-svg-wrap" id="qr-preview" data-no-i18n></div>
-              <div class="qr-empty" id="qr-empty">输入内容并点击“生成二维码”。</div>
-            </div>
+        </div>
+
+        <div data-panel="decode" hidden>
+          <div class="tool-grid tool-grid-wide">
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">QR</span><h2>选择二维码图片</h2></div>
+                <div class="card-actions"><span class="badge" id="qrd-badge">等待图片</span></div>
+              </div>
+              <div class="card-body">
+                <label class="file-drop" id="qrd-drop">
+                  <input type="file" id="qrd-file" accept="image/*">
+                  <strong>选择或拖入二维码图片</strong>
+                  <span>支持 PNG、JPEG、WebP 等常见图片，识别完全在本地完成。</span>
+                </label>
+                <div class="row-between">
+                  <span class="field-hint">图片不会上传，也不会离开当前页面。</span>
+                  <span class="status" id="qrd-status"></span>
+                </div>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <div class="card-heading"><span class="card-icon">TXT</span><h2>识别结果</h2></div>
+                <div class="card-actions">
+                  <button class="btn btn-sm" type="button" id="qrd-copy" data-copy="qrd-output">复制</button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="image-preview-wrap" id="qrd-preview-wrap" hidden>
+                  <img id="qrd-preview" alt="二维码预览">
+                </div>
+                <textarea id="qrd-output" class="code-area output-area" readonly spellcheck="false" placeholder="识别到的内容会显示在这里"></textarea>
+                <div class="meta-line" id="qrd-meta"></div>
+              </div>
+            </section>
           </div>
-        </section>
+        </div>
       </div>
     `;
 
@@ -1670,6 +1785,111 @@ console.log('CTool');
       if (status.classList.contains('error')) setStatus(status, '', '');
     });
     bindCtrlEnter(input, run);
+
+    /* 识别二维码：使用本地 jsQR，在 canvas 上读取像素，不联网 */
+    const qrdFile = $('#qrd-file', root);
+    const qrdDrop = $('#qrd-drop', root);
+    const qrdBadge = $('#qrd-badge', root);
+    const qrdStatus = $('#qrd-status', root);
+    const qrdOutput = $('#qrd-output', root);
+    const qrdMeta = $('#qrd-meta', root);
+    const qrdPreviewWrap = $('#qrd-preview-wrap', root);
+    const qrdPreview = $('#qrd-preview', root);
+
+    function qrdSetBadge(text, type) {
+      qrdBadge.textContent = text;
+      qrdBadge.className = 'badge' + (type ? ' badge-' + type : '');
+    }
+
+    function decodeQrFile(file) {
+      if (!file) return;
+      if (!/^image\//.test(file.type)) {
+        setStatus(qrdStatus, T.t('请选择图片文件'), 'warn');
+        return;
+      }
+      if (typeof window.jsQR !== 'function') {
+        setStatus(qrdStatus, T.t('二维码识别组件未加载'), 'error');
+        return;
+      }
+      qrdSetBadge(T.t('识别中…'), 'warn');
+      setStatus(qrdStatus, T.t('正在读取图片…'), 'info');
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        qrdPreview.src = dataUrl;
+        qrdPreviewWrap.hidden = false;
+        const image = new Image();
+        image.onload = () => {
+          const maxSide = 1600;
+          const scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
+          const width = Math.max(1, Math.round(image.naturalWidth * scale));
+          const height = Math.max(1, Math.round(image.naturalHeight * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const context2d = canvas.getContext('2d', { willReadFrequently: true });
+          context2d.drawImage(image, 0, 0, width, height);
+          let imageData;
+          try {
+            imageData = context2d.getImageData(0, 0, width, height);
+          } catch (_) {
+            qrdSetBadge(T.t('失败'), 'error');
+            setStatus(qrdStatus, T.t('无法读取图片像素'), 'error');
+            return;
+          }
+          let result = null;
+          try {
+            result = window.jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
+          } catch (_) {
+            result = null;
+          }
+          const dimensionText = image.naturalWidth + ' × ' + image.naturalHeight + ' px';
+          if (result && result.data) {
+            qrdOutput.value = result.data;
+            qrdMeta.textContent = dimensionText + ' · ' + result.data.length + ' ' + T.t('字符');
+            qrdSetBadge(T.t('识别成功'), 'ok');
+            setStatus(qrdStatus, '✓ ' + T.t('已识别二维码'), 'ok');
+          } else {
+            qrdOutput.value = '';
+            qrdMeta.textContent = dimensionText;
+            qrdSetBadge(T.t('未识别'), 'error');
+            setStatus(qrdStatus, T.t('没有识别到二维码，请换一张更清晰的图片'), 'error');
+          }
+        };
+        image.onerror = () => {
+          qrdSetBadge(T.t('失败'), 'error');
+          setStatus(qrdStatus, T.t('无法读取该图片'), 'error');
+        };
+        image.src = dataUrl;
+      };
+      reader.onerror = () => {
+        qrdSetBadge(T.t('失败'), 'error');
+        setStatus(qrdStatus, T.t('无法读取该图片'), 'error');
+      };
+      reader.readAsDataURL(file);
+    }
+
+    qrdFile.addEventListener('change', () => decodeQrFile(qrdFile.files && qrdFile.files[0]));
+    ['dragenter', 'dragover'].forEach((type) => {
+      qrdDrop.addEventListener(type, (event) => {
+        event.preventDefault();
+        qrdDrop.classList.add('dragging');
+      });
+    });
+    ['dragleave', 'drop'].forEach((type) => {
+      qrdDrop.addEventListener(type, (event) => {
+        event.preventDefault();
+        qrdDrop.classList.remove('dragging');
+      });
+    });
+    qrdDrop.addEventListener('drop', (event) => {
+      const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      decodeQrFile(file);
+    });
+
+    setupTabs(root);
+    bindCopyButtons(root);
+    if (context.text) input.value = context.text;
     run();
   };
 
