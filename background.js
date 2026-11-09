@@ -25,8 +25,26 @@ const CONTEXT_MENUS = [
   { id: 'sql-format', title: 'SQL 格式化', tool: 'sql', action: 'format' },
   { id: 'qrcode-generate', title: '生成二维码', tool: 'qrcode', action: 'generate' },
   { id: 'url-parse', title: '解析 URL', tool: 'urlparse', action: 'parse' },
-  { id: 'markdown-preview', title: 'Markdown 预览', tool: 'markdown', action: 'preview' }
+  { id: 'markdown-preview', title: 'Markdown 预览', tool: 'markdown', action: 'preview' },
+  { id: 'github-speed', title: 'GitHub 链接加速', tool: 'github', action: 'speed' },
+  { id: 'ai-ask', title: '💬 问 AI（免配置）', tool: 'ai', action: 'ask' }
 ];
+
+/* 链接右键：不需要先复制链接，直接把 info.linkUrl 传进 GitHub 工具。
+   网页访问加速（🌐 用镜像访问此链接）已下线：没有可用的同构镜像站。 */
+const LINK_MENUS = [
+  { id: 'ctool-gh-link', title: '⚡ 用 CTool 加速此链接', action: 'speed' },
+  { id: 'ctool-gh-link-download', title: '⚡ CTool 一键加速下载', action: 'quick-download' }
+];
+
+/* 所有链接打开统一新标签页：原样打开 URL，不做任何域名替换，
+   不改写当前标签页 / 小窗 iframe。 */
+async function openNewTab(rawUrl) {
+  const url = String(rawUrl || '').split('#')[0];
+  if (!/^https?:\/\//i.test(url)) return { ok: false, reason: 'invalid-url' };
+  await chrome.tabs.create({ url: url, active: true });
+  return { ok: true, url: url };
+}
 
 function createContextMenus() {
   chrome.contextMenus.removeAll(() => {
@@ -42,6 +60,15 @@ function createContextMenus() {
         parentId: 'ctool-parent',
         title: item.title,
         contexts: ['selection']
+      });
+    });
+
+    LINK_MENUS.forEach((item) => {
+      chrome.contextMenus.create({
+        id: item.id,
+        title: item.title,
+        contexts: ['link'],
+        documentUrlPatterns: ['*://github.com/*', '*://*.github.com/*']
       });
     });
   });
@@ -131,6 +158,47 @@ async function openCompactPanel(task, sourceTabId) {
   await openCompactWindow(task);
 }
 
+/* 工具页「扫描本页链接」：优先来源标签页，其次当前所有 GitHub 标签页。
+   只收集可下载链接；网页访问扫描已下线，第二个参数保留作兼容。 */
+async function scanGithubLinks(preferredTabId) {
+  const candidates = [];
+  if (typeof preferredTabId === 'number') candidates.push(preferredTabId);
+  try {
+    const saved = await chrome.storage.local.get('ctool_source_tab');
+    if (saved && typeof saved.ctool_source_tab === 'number') candidates.push(saved.ctool_source_tab);
+  } catch (_) {
+    // 存储不可用时继续用标签页查询。
+  }
+
+  try {
+    const tabs = await chrome.tabs.query({});
+    tabs.forEach((tab) => {
+      if (typeof tab.id === 'number' && /github\.com|githubusercontent\.com/i.test(tab.url || '')) {
+        candidates.push(tab.id);
+      }
+    });
+  } catch (_) {
+    // 忽略查询失败。
+  }
+
+  const seen = new Set();
+  for (const tabId of candidates) {
+    if (seen.has(tabId)) continue;
+    seen.add(tabId);
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, {
+        type: 'ctool-scan-github-links'
+      });
+      if (response && response.ok && Array.isArray(response.links)) {
+        return { ok: true, links: response.links, pageUrl: response.pageUrl || '', tabId: tabId };
+      }
+    } catch (_) {
+      // 该标签页没有内容脚本时继续尝试下一个。
+    }
+  }
+  return { ok: false, reason: 'no-tab' };
+}
+
 async function injectFloatingIconIntoOpenTabs() {
   let tabs = [];
   try {
@@ -173,6 +241,24 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.contextMenus.onClicked.addListener((info) => {
   if (info.menuItemId === 'ctool-parent') return;
 
+  const linkItem = LINK_MENUS.find((entry) => entry.id === info.menuItemId);
+  if (linkItem) {
+    const linkUrl = String(info.linkUrl || '');
+    if (!/github\.com|githubusercontent\.com/i.test(linkUrl)) return;
+    const linkTabId = info.tab && typeof info.tab.id === 'number' ? info.tab.id : undefined;
+    openCompactPanel({
+      tool: 'github',
+      action: linkItem.action,
+      text: linkUrl,
+      source: 'link-context-menu',
+      pageUrl: info.pageUrl || '',
+      pageTitle: info.tab && info.tab.title ? info.tab.title : '',
+      sourceTabId: linkTabId,
+      createdAt: Date.now()
+    }, linkTabId);
+    return;
+  }
+
   const item = CONTEXT_MENUS.find((entry) => entry.id === info.menuItemId);
   if (!item) return;
 
@@ -214,5 +300,106 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  /* 页面注入器在没有宿主回调时的兜底 */
+  if (message.type === 'ctool-page-task') {
+    const task = message.task || null;
+    if (task && task.action === 'visit' && typeof task.text === 'string' && task.text) {
+      openNewTab(task.text).then(sendResponse).catch((error) => {
+        sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
+      });
+      return true;
+    }
+    const tabId = sender.tab && typeof sender.tab.id === 'number' ? sender.tab.id : undefined;
+    openCompactPanel(task, tabId).then(() => {
+      sendResponse({ ok: true });
+    }).catch((error) => {
+      sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
+    });
+    return true;
+  }
+
+  /* 工具页「打开」、页面注入器的站内链接点击、旧版访问消息统一新标签页 */
+  if (message.type === 'ctool-open-new-tab' || message.type === 'ctool-visit-github') {
+    openNewTab(message.url).then(sendResponse).catch((error) => {
+      sendResponse({ ok: false, error: String(error && error.message ? error.message : error) });
+    });
+    return true;
+  }
+
+  if (message.type === 'ctool-scan-github-links') {
+    scanGithubLinks(typeof message.tabId === 'number' ? message.tabId : undefined).then((result) => {
+      sendResponse(result);
+    }).catch((error) => {
+      sendResponse({ ok: false, reason: String(error && error.message ? error.message : error) });
+    });
+    return true;
+  }
+
+  /* AI 问答兜底：扩展页面直连被 CORS 拦截时由 service worker 发请求。
+     匿名 Zen 请求需要稳定的会话标识，页面 fetch 无法保证，这里统一补齐。 */
+  if (message.type === 'ctool-ai-fetch') {
+    (async () => {
+      const url = String(message.url || '');
+      const allowed = /^https:\/\//i.test(url) ||
+        /^http:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?\//i.test(url);
+      if (!allowed) {
+        sendResponse({ ok: false, status: 0, statusText: '', text: '不支持的接口地址' });
+        return;
+      }
+      const headers = Object.assign({}, message.headers || {});
+      if (/^https:\/\/opencode\.ai\//i.test(url) && !headers.Authorization) {
+        const sid = await zenAnonymousSession();
+        headers['x-session-id'] = headers['x-session-id'] || sid;
+        headers['x-opencode-session'] = headers['x-opencode-session'] || sid;
+      }
+      /* AI 问答用 POST；网页镜像站可用性检测用 GET（不带请求体） */
+      const method = String(message.method || 'POST').toUpperCase() === 'GET' ? 'GET' : 'POST';
+      const init = { method: method, headers: headers };
+      if (method === 'POST') {
+        init.body = typeof message.body === 'string'
+          ? message.body
+          : JSON.stringify(message.body || {});
+      }
+      const response = await fetch(url, init);
+      const text = await response.text();
+      sendResponse({
+        ok: response.ok,
+        status: response.status,
+        statusText: response.statusText || '',
+        /* GET 只用于可用性探测，页面 HTML 截断即可，避免大体积消息 */
+        text: method === 'GET' ? text.slice(0, 20000) : text
+      });
+    })().catch((error) => {
+      sendResponse({
+        ok: false,
+        status: 0,
+        statusText: '',
+        text: '',
+        error: String(error && error.message ? error.message : error)
+      });
+    });
+    return true;
+  }
+
   return false;
 });
+
+/* OpenCode Zen 匿名免费层的稳定会话标识（跨 service worker 重启保持不变） */
+let zenSessionCache = null;
+async function zenAnonymousSession() {
+  if (zenSessionCache) return zenSessionCache;
+  try {
+    const saved = await chrome.storage.local.get('ctoolZenSession');
+    if (saved && typeof saved.ctoolZenSession === 'string' && saved.ctoolZenSession) {
+      zenSessionCache = saved.ctoolZenSession;
+    }
+  } catch (_) { /* 存储不可用时退化为本次会话内的标识 */ }
+  if (!zenSessionCache) {
+    const random = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : String(Date.now()) + Math.random().toString(16).slice(2);
+    zenSessionCache = 'ses_ctool' + random.replace(/-/g, '');
+    try { await chrome.storage.local.set({ ctoolZenSession: zenSessionCache }); } catch (_) {}
+  }
+  return zenSessionCache;
+}

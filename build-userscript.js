@@ -6,7 +6,8 @@
  *
  * 产出 ctool.user.js：一个可直接上传 / 安装到 Tampermonkey、Violentmonkey 的 .js 文件。
  * 把 toolbox.html、css/style.css、全部工具脚本与两张赞赏码内联进隔离 iframe，
- * 不依赖任何外部文件，也不发起网络请求。源码改动后重新运行本脚本即可刷新产物。
+ * 不依赖任何外部文件；默认不主动发起网络请求（AI 问答与 GitHub 测速由用户触发）。
+ * 源码改动后重新运行本脚本即可刷新产物。
  */
 'use strict';
 
@@ -121,6 +122,51 @@ const BOOTSTRAP = String.raw`
       try { parent.postMessage({ type: 'ctool-panel-close' }, '*'); } catch (err) {}
     }
   }, true);
+
+  /* 5) AI 请求桥：iframe 内 fetch 受目标站点 CORS 限制，交给宿主 GM_xmlhttpRequest */
+  var aiSeq = 0;
+  var aiPending = {};
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.type !== 'ctool-ai-fetch-result') return;
+    var done = aiPending[d.id];
+    if (!done) return;
+    delete aiPending[d.id];
+    done(d);
+  });
+  var CT = (window.CTool = window.CTool || {});
+  CT.aiBridge = true;
+  CT.aiFetch = function (url, options) {
+    options = options || {};
+    var id = 'ai' + (++aiSeq) + '_' + Date.now();
+    return new Promise(function (resolve, reject) {
+      aiPending[id] = function (d) {
+        if (d.error && !d.text) { reject(new Error(d.error)); return; }
+        var text = typeof d.text === 'string' ? d.text : '';
+        resolve({
+          ok: d.ok === true,
+          status: Number(d.status) || 0,
+          statusText: String(d.statusText || ''),
+          body: null,
+          text: function () { return Promise.resolve(text); },
+          json: function () { return Promise.resolve(JSON.parse(text || '{}')); }
+        });
+      };
+      try {
+        parent.postMessage({
+          type: 'ctool-ai-fetch',
+          id: id,
+          url: url,
+          method: options.method || 'GET',
+          headers: options.headers || {},
+          body: options.body || null
+        }, '*');
+      } catch (err) {
+        delete aiPending[id];
+        reject(err);
+      }
+    });
+  };
 })();
 `.replace('__CT_VERSION__', VERSION);
 
@@ -143,7 +189,7 @@ const DOWNLOAD_OVERRIDE = String.raw`
               'This tool needs Chrome extension APIs and is unavailable in the userscript build.' +
             '</div>' +
             '<div class="field-hint" data-no-i18n>' +
-              '其余 34 个工具均可正常使用；如需网页资源批量下载，请安装完整版 Chrome / Edge 扩展。' +
+              '其余 35 个工具均可正常使用；如需网页资源批量下载，请安装完整版 Chrome / Edge 扩展。' +
             '</div>' +
           '</div>' +
         '</section>' +
@@ -196,12 +242,77 @@ function userscriptMain() {
   const HTML_TPL = __HTML_TPL__;
   const STORE_KEY = 'ctoolUserPrefs';
   const canGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+  const scanner = window.CToolPageGithub || null;
+  const aiXhr = new Map();
+  let pendingTask = null;
+  let frameReady = false;
 
   let prefs = {};
   if (canGM) {
     try { prefs = GM_getValue(STORE_KEY, {}) || {}; } catch (e) { prefs = {}; }
   }
   if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = {};
+
+  /* 网页访问加速已下线：不再保存 / 使用任何镜像域名；站内链接统一新标签页 */
+  const DEFAULT_IMAGE_NODE = 'https://gh-proxy.com';
+  let imageNode = imageNodeValue(prefStr('githubImageNode', ''));
+  let newTabLinks = prefBool('githubNewTabLinks', true);
+  let imageBoost = prefBool('githubImageBoost', false);
+
+  function prefStr(key, fallback) {
+    const v = prefs['ctool.' + key];
+    if (v == null) return fallback;
+    try {
+      const parsed = JSON.parse(v);
+      return typeof parsed === 'string' ? parsed : fallback;
+    } catch (e) { return typeof v === 'string' ? v : fallback; }
+  }
+
+  function imageNodeValue(value) {
+    const raw = String(value == null ? '' : value).trim();
+    return /^https?:\/\//i.test(raw) ? raw : DEFAULT_IMAGE_NODE;
+  }
+
+  /* 文件代理前缀拼接（图片资源使用） */
+  function mirror(rawUrl, node) {
+    const n = String(node || DEFAULT_IMAGE_NODE).replace(/\/+$/, '');
+    if (!rawUrl || !n) return '';
+    const sep = /[?=&]$/.test(n) ? '' : '/';
+    return n + sep + String(rawUrl).replace(/^\/+/, '');
+  }
+
+  /* 所有链接统一新标签页打开：原样打开 URL，不做域名替换，不改写当前页面。
+     由页面注入器（站内链接）与 iframe 工具页（ctool-open-new-tab）共同调用。 */
+  function openNewTabUrl(url) {
+    const target = String(url || '').split('#')[0];
+    if (!/^https?:\/\//i.test(target)) return false;
+    try {
+      if (typeof GM_openInTab === 'function') {
+        GM_openInTab(target, { active: true });
+        return true;
+      }
+    } catch (e) { /* 退回 window.open */ }
+    try {
+      window.open(target, '_blank', 'noopener,noreferrer');
+      return true;
+    } catch (ignored) {
+      return false;
+    }
+  }
+
+  function applyPageSettings(settings) {
+    if (!settings || typeof settings !== 'object') return;
+    newTabLinks = settings.newTabLinks !== false;
+    imageBoost = settings.imageBoost === true;
+    if (typeof settings.imageNode === 'string' && /^https?:\/\//i.test(settings.imageNode)) {
+      imageNode = settings.imageNode;
+    }
+    if (scanner) {
+      if (typeof scanner.setNewTabLinks === 'function') scanner.setNewTabLinks(newTabLinks);
+      if (typeof scanner.setImageBoost === 'function') scanner.setImageBoost(imageBoost);
+      if (typeof scanner.refresh === 'function') scanner.refresh();
+    }
+  }
 
   function buildHtml() {
     const seed = JSON.stringify(prefs)
@@ -215,6 +326,108 @@ function userscriptMain() {
   function css(el, rules) {
     Object.keys(rules).forEach(function (k) { el.style[k] = rules[k]; });
     return el;
+  }
+
+  /* getPref 写入的键在桥里保留 'ctool.' 前缀，值经过 JSON.stringify */
+  function prefBool(key, fallback) {
+    const v = prefs['ctool.' + key];
+    if (v == null) return fallback;
+    try { return JSON.parse(v) !== false; } catch (e) { return v !== 'false'; }
+  }
+
+  function deliverTask() {
+    if (!pendingTask || !frameReady || !frame || !frame.contentWindow) return;
+    const task = pendingTask;
+    pendingTask = null;
+    try {
+      frame.contentWindow.postMessage({ type: 'ctool-apply-task', task: task }, '*');
+    } catch (e) {
+      pendingTask = task;
+    }
+  }
+
+  function clickDownload(url, filename) {
+    try {
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      /* 始终保留 download 与 _blank，避免当前页面被导航到镜像地址 */
+      anchor.download = filename || '';
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      setTimeout(function () { anchor.remove(); }, 1000);
+    } catch (e) {}
+  }
+
+  /* OpenCode Zen 匿名免费层需要稳定的会话标识，跨站点保存一次即可 */
+  function aiSession() {
+    let sid = prefStr('aiZenSession', '');
+    if (!sid) {
+      const random = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : String(Date.now()) + Math.random().toString(16).slice(2);
+      sid = 'ses_ctool' + String(random).replace(/-/g, '');
+      prefs['ctool.aiZenSession'] = JSON.stringify(sid);
+      if (canGM) { try { GM_setValue(STORE_KEY, prefs); } catch (e) {} }
+    }
+    return sid;
+  }
+
+  /* iframe 内的 AI 请求由宿主用 GM_xmlhttpRequest 发出，绕开页面 CORS */
+  function aiFetch(d, source) {
+    const reply = function (payload) {
+      const target = source || (frame && frame.contentWindow);
+      try {
+        target.postMessage(Object.assign({ type: 'ctool-ai-fetch-result', id: d.id }, payload), '*');
+      } catch (e) {}
+    };
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      reply({ ok: false, status: 0, statusText: '', text: '', error: 'GM_xmlhttpRequest unavailable' });
+      return;
+    }
+    const url = String(d.url || '');
+    if (!/^https:\/\//i.test(url) && !/^http:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?\//i.test(url)) {
+      reply({ ok: false, status: 0, statusText: '', text: '', error: 'Unsupported URL' });
+      return;
+    }
+    const headers = Object.assign({}, d.headers || {});
+    if (/^https:\/\/opencode\.ai\//i.test(url) && !headers.Authorization) {
+      const sid = aiSession();
+      headers['x-session-id'] = headers['x-session-id'] || sid;
+      headers['x-opencode-session'] = headers['x-opencode-session'] || sid;
+    }
+    try {
+      const handle = GM_xmlhttpRequest({
+        method: d.method || 'GET',
+        url: url,
+        headers: headers,
+        data: d.method === 'POST' ? (d.body || '{}') : undefined,
+        timeout: 90000,
+        onload: function (res) {
+          aiXhr.delete(d.id);
+          reply({
+            ok: res.status >= 200 && res.status < 300,
+            status: res.status,
+            statusText: res.statusText || '',
+            text: res.responseText || ''
+          });
+        },
+        onerror: function () {
+          aiXhr.delete(d.id);
+          reply({ ok: false, status: 0, statusText: '', text: '', error: 'Network error' });
+        },
+        ontimeout: function () {
+          aiXhr.delete(d.id);
+          reply({ ok: false, status: 0, statusText: '', text: '', error: 'Request timed out' });
+        },
+        onabort: function () { aiXhr.delete(d.id); }
+      });
+      if (handle && typeof handle.abort === 'function') aiXhr.set(d.id, handle);
+    } catch (e) {
+      reply({ ok: false, status: 0, statusText: '', text: '', error: String(e && e.message || e) });
+    }
   }
 
   function openTab() {
@@ -250,6 +463,8 @@ function userscriptMain() {
       boxShadow: '0 24px 70px rgba(0,0,0,0.3)'
     });
     frame.addEventListener('load', function () {
+      frameReady = true;
+      deliverTask();
       setTimeout(function () {
         try {
           if (frame.contentWindow && frame.contentWindow.CTool &&
@@ -295,11 +510,13 @@ function userscriptMain() {
     (document.body || document.documentElement).appendChild(overlay);
   }
 
-  function open() {
+  function open(task) {
+    if (task && typeof task === 'object') pendingTask = task;
     ensureUI();
     if (!built) { frame.srcdoc = buildHtml(); built = true; }
     overlay.style.display = 'block';
     launcher.style.transform = 'scale(0.92)';
+    deliverTask();
   }
   function close() {
     if (overlay) overlay.style.display = 'none';
@@ -332,9 +549,72 @@ function userscriptMain() {
     const d = event.data;
     if (!d || typeof d !== 'object') return;
     if (d.type === 'ctool-panel-close') { close(); return; }
+    if (d.type === 'ctool-page-task' && d.task) {
+      /* 旧版 🌐 图标遗留的 visit 任务：只开新标签页，不做域名替换 */
+      if (d.task.action === 'visit' && typeof d.task.text === 'string' && d.task.text) {
+        openNewTabUrl(d.task.text);
+        return;
+      }
+      open(d.task);
+      return;
+    }
+    if (d.type === 'ctool-github-badges' && scanner) { scanner.setEnabled(d.enabled !== false); return; }
+    if (d.type === 'ctool-github-visit-settings') { applyPageSettings(d); return; }
+    /* 工具页「打开」、页面注入器站内链接、旧版访问消息统一新标签页 */
+    if (d.type === 'ctool-open-new-tab' && typeof d.url === 'string' && d.url) {
+      openNewTabUrl(d.url);
+      if (d.ack) {
+        try { event.source.postMessage({ type: 'ctool-open-new-tab-ack' }, '*'); } catch (e) {}
+      }
+      return;
+    }
+    if (d.type === 'ctool-open-visit' && typeof d.url === 'string' && d.url) {
+      openNewTabUrl(d.url);
+      return;
+    }
+    /* 「加速访问此页面」已屏蔽：ctool-visit-current-page 不再响应 */
+    if (d.type === 'ctool-visit-scan-request' && frame && frame.contentWindow) {
+      try {
+        frame.contentWindow.postMessage({ type: 'ctool-visit-scan-result', links: [] }, '*');
+      } catch (e) {}
+      return;
+    }
+    if (d.type === 'ctool-scan-request' && frame && frame.contentWindow) {
+      try {
+        frame.contentWindow.postMessage({
+          type: 'ctool-scan-result',
+          links: scanner ? scanner.collect(false) : []
+        }, '*');
+      } catch (e) {}
+      return;
+    }
+    if (d.type === 'ctool-direct-download' && typeof d.url === 'string' && d.url) {
+      clickDownload(d.url, d.filename || '');
+      if (d.ack) {
+        try { event.source.postMessage({ type: 'ctool-direct-download-ack' }, '*'); } catch (e) {}
+      }
+      return;
+    }
+    if (d.type === 'ctool-ai-fetch') { aiFetch(d, event.source); return; }
+    if (d.type === 'ctool-ai-abort') {
+      const handle = aiXhr.get(d.id);
+      if (handle) {
+        try { handle.abort(); } catch (e) {}
+        aiXhr.delete(d.id);
+      }
+      return;
+    }
     if (d.__ctoolPrefs === 'set' && d.data && typeof d.data === 'object') {
       prefs = d.data;
       if (canGM) { try { GM_setValue(STORE_KEY, prefs); } catch (e) {} }
+      if (scanner) {
+        scanner.setEnabled(prefBool('githubPageBadges', true));
+        applyPageSettings({
+          newTabLinks: prefBool('githubNewTabLinks', true),
+          imageBoost: prefBool('githubImageBoost', false),
+          imageNode: prefStr('githubImageNode', '') || imageNode
+        });
+      }
     }
   });
 
@@ -346,10 +626,27 @@ function userscriptMain() {
   }, true);
 
   installLauncher();
+  if (scanner && typeof scanner.install === 'function') {
+    scanner.install({
+      getEnabled: function () { return prefBool('githubPageBadges', true); },
+      getNewTabLinks: function () { return newTabLinks; },
+      getImageBoost: function () { return imageBoost; },
+      getImageNode: function () { return imageNode; },
+      /* 兼容旧注入器：镜像域名恒为空 */
+      getVisitMirror: function () { return ''; },
+      /* 站内链接点击只负责新开标签页，不做任何域名替换 */
+      openNewTab: function (url) { return openNewTabUrl(url); },
+      visitUrl: function (url) { return openNewTabUrl(url); },
+      openTask: function (task) { open(task); }
+    });
+  }
   if (typeof GM_registerMenuCommand === 'function') {
     try { GM_registerMenuCommand('打开 / 关闭 CTool 工具箱 (v' + VERSION + ')', toggle); } catch (e) {}
   }
 }
+
+/* 宿主页面侧的 GitHub 链接注入器：扩展由 manifest 加载，油猴版内联在同一份 .js 里 */
+const pageGithubSrc = read('js/page-github.js');
 
 const header = [
   '// ==UserScript==',
@@ -357,12 +654,14 @@ const header = [
   '// @name:en      CTool Toolkit (Userscript)',
   '// @namespace    ctool-userscript',
   '// @version      ' + VERSION,
-  '// @description  35 个离线开发者工具，悬浮按钮 / 菜单 / Alt+Shift+C 打开；数据仅在本机处理。',
+  '// @description  36 个本地开发者工具，AI 问答内置 OpenCode Zen 免配置可用；GitHub 下载走实测可用的代理节点，所有 GitHub 链接与站内链接默认新标签页打开；悬浮按钮 / 菜单 / Alt+Shift+C 打开，默认不主动联网。',
   '// @author       CTool',
   '// @license      Bundled vendors: jsQR Apache-2.0, JSZip MIT/GPLv3, qrcode MIT',
   '// @match        *://*/*',
+  '// @connect      *',
   '// @grant        GM_getValue',
   '// @grant        GM_setValue',
+  '// @grant        GM_xmlhttpRequest',
   '// @grant        GM_registerMenuCommand',
   '// @grant        GM_openInTab',
   '// @run-at       document-idle',
@@ -371,14 +670,17 @@ const header = [
   '',
   '/*',
   ' * 由 build-userscript.js 从 CTool 扩展源码生成，请勿直接编辑本文件。',
-  ' * 内联：toolbox.html + css/style.css + ' + scriptSrcs.length + ' 个 JS + 2 张赞赏码（Base64）。',
-  ' * 零外部依赖、零网络请求；网页资源下载工具在非扩展环境下显示不可用提示。',
+ ' * 内联：toolbox.html + css/style.css + ' + scriptSrcs.length + ' 个 JS + 2 张赞赏码（Base64）。',
+ ' * 宿主侧另内联 js/page-github.js（下载图标走文件代理；网页访问加速已下线，GitHub 站内链接统一新标签页打开；图片加速单独分流）。',
+ ' * AI 问答通过 GM_xmlhttpRequest 桥发请求以绕开 iframe 的 CORS 限制；网页资源下载工具在非扩展环境下显示不可用提示。',
+ ' * 零外部依赖、默认不主动发起网络请求（AI 问答与 GitHub 测速由用户触发）。',
   ' */',
   ''
 ].join('\n');
 
 const mainSrc = '(' + userscriptMain.toString() + ')();';
-const output = header + mainSrc
+const HOST_ENHANCER = '/* ===== page-github.js (host: GitHub link enhancer) ===== */\n' + pageGithubSrc + '\n\n';
+const output = header + HOST_ENHANCER + mainSrc
   .split('__HTML_TPL__').join(tplLiteral(doc))
   .split('__CT_VERSION__').join(VERSION) + '\n';
 

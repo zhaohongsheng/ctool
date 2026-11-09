@@ -3,12 +3,14 @@
 // @name:en      CTool Toolkit (Userscript)
 // @namespace    ctool-userscript
 // @version      1.4.0
-// @description  35 个离线开发者工具，悬浮按钮 / 菜单 / Alt+Shift+C 打开；数据仅在本机处理。
+// @description  36 个本地开发者工具，AI 问答内置 OpenCode Zen 免配置可用；GitHub 下载走实测可用的代理节点，所有 GitHub 链接与站内链接默认新标签页打开；悬浮按钮 / 菜单 / Alt+Shift+C 打开，默认不主动联网。
 // @author       CTool
 // @license      Bundled vendors: jsQR Apache-2.0, JSZip MIT/GPLv3, qrcode MIT
 // @match        *://*/*
+// @connect      *
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
 // @run-at       document-idle
@@ -17,9 +19,753 @@
 
 /*
  * 由 build-userscript.js 从 CTool 扩展源码生成，请勿直接编辑本文件。
- * 内联：toolbox.html + css/style.css + 16 个 JS + 2 张赞赏码（Base64）。
- * 零外部依赖、零网络请求；网页资源下载工具在非扩展环境下显示不可用提示。
+ * 内联：toolbox.html + css/style.css + 17 个 JS + 2 张赞赏码（Base64）。
+ * 宿主侧另内联 js/page-github.js（下载图标走文件代理；网页访问加速已下线，GitHub 站内链接统一新标签页打开；图片加速单独分流）。
+ * AI 问答通过 GM_xmlhttpRequest 桥发请求以绕开 iframe 的 CORS 限制；网页资源下载工具在非扩展环境下显示不可用提示。
+ * 零外部依赖、默认不主动发起网络请求（AI 问答与 GitHub 测速由用户触发）。
  */
+/* ===== page-github.js (host: GitHub link enhancer) ===== */
+/* CTool - GitHub 页面链接识别与下载图标（宿主页面侧，扩展 / 油猴共用）
+ *
+ * 职责：
+ *   - 自动识别页面上的可下载链接（Release 附件 / 源码包 / Raw / LFS / Patch）
+ *   - 下载类链接后插入 ⚡ / ↓ 图标，点击即把链接作为参数投递给 CTool 的 GitHub 工具
+ *   - 右下角浮动 chip 批量载入本页下载链接
+ *   - 「站内链接新标签页」：拦截 GitHub 站内普通网页链接的左键点击，交给宿主新开标签页
+ *   - 可选「图片资源加速」：把 GitHub 图床 / Raw 图片交给下载代理加载
+ *   - 支持 Turbo / pjax 导航与动态 DOM 重扫，可随时开关
+ *
+ * 已下线：网页访问加速（🌐 图标 / 加速访问此页面 / 自动镜像代理 / 域名替换）。
+ *         实测第三方同构镜像站普遍关停或只对 git / CLI 放行，保留入口只会误导用户。
+ *         相关纯函数仅保留作兼容，不再产生任何界面与跳转。
+ *
+ * 约束：本文件自身不发起网络请求；不读取链接与图片地址以外的页面内容；
+ *       不改写任何链接的 href（新标签页只拦截点击）。
+ *       图标只在 github.com / gist.github.com 页面注入；其余站点不启动观察器。
+ */
+(function () {
+  'use strict';
+
+  if (window.top && window.top !== window) return;
+
+  const HOST_CLASS = 'ctool-gh-host';
+  const CHIP_ID = 'ctool-gh-chip-host';
+  const BADGE_LIMIT = 60;
+  const VISIT_LIMIT = 20;   /* 兼容旧版 limits 导出：已不再注入网页访问图标 */
+  const COLLECT_LIMIT = 20;
+  const IMAGE_LIMIT = 200;
+  const RESCAN_DELAY = 180;
+  /* 网页访问加速已下线：镜像域名恒为空，任何地方都不再做域名替换 */
+  const DEFAULT_VISIT_HOST = '';
+  const DEFAULT_IMAGE_NODE = 'https://gh-proxy.com';
+
+  const GITHUB_HOST = /(^|\.)(github\.com|githubusercontent\.com)$/i;
+  const INJECT_HOST = /(^|\.)github\.com$/i;
+  /* README / Issue 里最常见的 GitHub 图床域名 */
+  const IMAGE_HOST = /(^|\.)(user-images|private-user-images|avatars|raw|media)\.githubusercontent\.com$/i;
+  /* 登录后操作、写操作与账户页：第三方镜像拿不到 Cookie，代理必然失效 */
+  const SENSITIVE_PATH = /\/(login|logout|signup|join|sessions?|auth|oauth|settings|account|billing|security|admin|notifications|marketplace|sponsors|apps|organizations|orgs)(\/|$)/i;
+  const FILE_EXT = /\.(patch|diff|zip|tar|gz|tgz|rar|7z|exe|dmg|deb|rpm|msi|apk|whl|jar|pdf|png|jpe?g|gif|svg|webp|mp4|mov|bin)$/i;
+
+  const BADGE_CSS = `
+    :host {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      margin-left: 6px;
+      vertical-align: middle;
+      all: initial;
+    }
+    * { box-sizing: border-box; }
+    button {
+      display: inline-grid;
+      place-items: center;
+      width: 21px;
+      height: 21px;
+      padding: 0;
+      margin: 0;
+      border: 1px solid rgba(99, 102, 241, 0.32);
+      border-radius: 6px;
+      background: rgba(99, 102, 241, 0.10);
+      color: #4f46e5;
+      cursor: pointer;
+      font: 12px/1 system-ui, sans-serif;
+      vertical-align: middle;
+      transition: background .15s ease, color .15s ease, transform .15s ease;
+    }
+    button:hover { background: #4f46e5; color: #fff; transform: translateY(-1px); }
+    button:active { transform: translateY(0); }
+    button:focus-visible { outline: 2px solid #6366f1; outline-offset: 2px; }
+    svg { width: 13px; height: 13px; pointer-events: none; }
+    svg.bolt { fill: currentColor; stroke: none; }
+    svg.down { fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+    :host-context(html[data-color-mode="dark"]) button {
+      border-color: rgba(129, 140, 248, 0.45);
+      background: rgba(129, 140, 248, 0.16);
+      color: #a5b4fc;
+    }
+    :host-context(html[data-color-mode="dark"]) button:hover { background: #6366f1; color: #fff; }
+  `;
+  const CHIP_CSS = `
+    :host {
+      position: fixed;
+      right: 20px;
+      bottom: 76px;
+      z-index: 2147483645;
+      all: initial;
+    }
+    .wrap { display: inline-flex; align-items: center; gap: 4px; }
+    button {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border: 1px solid rgba(99, 102, 241, 0.36);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.96);
+      color: #3730a3;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.18);
+      cursor: pointer;
+      font: 600 12px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      white-space: nowrap;
+    }
+    button:hover { background: #eef2ff; border-color: #6366f1; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #6366f1; }
+    :host-context(html[data-color-mode="dark"]) button {
+      background: rgba(30, 41, 59, 0.96);
+      color: #c7d2fe;
+      border-color: rgba(129, 140, 248, 0.5);
+    }
+  `;
+
+  const ICON_BOLT = '<svg class="bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4.5 13.5H10L9 22l9.5-12H13l1-8Z"/></svg>';
+  const ICON_DOWN = '<svg class="down" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M4 20h16"/></svg>';
+
+  let options = null;
+  let enabled = true;
+  let newTabLinks = true;
+  let imageBoost = false;
+  let observer = null;
+  let scanTimer = null;
+  let navTimer = null;
+  let lastHref = '';
+  let sharedBadgeSheet = null;
+  let sharedChipSheet = null;
+  let started = false;
+
+  /* ---------------- 纯函数 ---------------- */
+
+  function isGithubPage(url) {
+    try {
+      return GITHUB_HOST.test(new URL(String(url || location.href)).hostname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isInjectablePage(url) {
+    try {
+      return INJECT_HOST.test(new URL(String(url || location.href)).hostname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /* 文件代理：前缀 + 完整 GitHub 链接（图片 / Raw 资源使用） */
+  function mirrorUrl(url, nodeUrl) {
+    const node = String(nodeUrl || DEFAULT_IMAGE_NODE).replace(/\/+$/, '');
+    if (!url || !node) return '';
+    const sep = /[?=&]$/.test(node) ? '' : '/';
+    return node + sep + String(url).replace(/^\/+/, '');
+  }
+
+  /* 只接受纯域名；旧版偏好里的前缀 URL 会被淘汰，避免把下载代理当网页镜像 */
+  function normalizeVisitHost(value) {
+    const raw = String(value == null ? '' : value).trim().toLowerCase();
+    if (!raw || raw === 'auto' || raw.indexOf('://') !== -1 || /[/?#\\]/.test(raw)) return '';
+    if (!/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(raw)) return '';
+    return raw;
+  }
+
+  /* 同构镜像站：把 github.com 整个替换成镜像域名，路径 / 查询串保持不变 */
+  function visitUrl(pageUrl, mirrorHost) {
+    const host = normalizeVisitHost(mirrorHost);
+    /* 没有可用镜像站时返回空，由调用方回退直连原链接 */
+    if (!host) return '';
+    let parsed;
+    try {
+      parsed = new URL(String(pageUrl));
+    } catch (_) {
+      return '';
+    }
+    if (!/^https?:$/i.test(parsed.protocol)) return '';
+    if (!/^(?:www\.)?github\.com$/i.test(parsed.hostname)) return '';
+    parsed.hostname = host;
+    return parsed.href;
+  }
+
+  function currentVisitMirror() {
+    let host = '';
+    const getter = options && typeof options.getVisitMirror === 'function'
+      ? options.getVisitMirror
+      : (options && typeof options.getVisitNode === 'function' ? options.getVisitNode : null);
+    if (getter) {
+      try { host = getter(); } catch (_) { host = ''; }
+    }
+    return normalizeVisitHost(host) || DEFAULT_VISIT_HOST;
+  }
+
+
+  /* 图片资源是文件，仍使用下载代理池的首选前缀 */
+  function currentImageNode() {
+    let node = '';
+    if (options && typeof options.getImageNode === 'function') {
+      try { node = options.getImageNode(); } catch (_) { node = ''; }
+    }
+    const value = String(node || DEFAULT_IMAGE_NODE);
+    return /^https?:\/\//i.test(value) ? value : DEFAULT_IMAGE_NODE;
+  }
+
+  /* 把页面里可能是相对路径的 href 变成规范化的绝对链接；非 GitHub 资源返回 '' */
+  function normalizeLink(href, base) {
+    const raw = String(href == null ? '' : href).trim();
+    if (!raw || /^(?:javascript|data|mailto):|^#/i.test(raw)) return '';
+    let parsed;
+    try {
+      parsed = new URL(raw, String(base || location.href));
+    } catch (_) {
+      return '';
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+    if (!GITHUB_HOST.test(parsed.hostname)) return '';
+    /* 保留查询串（Release 附件可能带签名参数），只去掉页内锚点 */
+    parsed.hash = '';
+    return parsed.href;
+  }
+
+  /* 识别「可直接下载」的 GitHub 资源类型，页面导航链接返回 '' */
+  function classify(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_) {
+      return '';
+    }
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname;
+    if (/^objects\.githubusercontent\.com$/.test(host) || /\/releases\/download\//i.test(path)) return 'release';
+    if (/^codeload\.github\.com$/.test(host) || /\/archive\//i.test(path) || /\/(zipball|tarball)\//i.test(path)) return 'archive';
+    if (/^(raw|gist)\.githubusercontent\.com$/.test(host) || /\/raw\//i.test(path)) return 'raw';
+    if (/^media\.githubusercontent\.com$/.test(host) || /\/info\/lfs\/objects\//i.test(path)) return 'lfs';
+    if (/\.(patch|diff)$/i.test(path)) return 'patch';
+    return '';
+  }
+
+  /* 识别「可以用镜像打开浏览」的 GitHub 网页链接。
+     与下载加速的关键差异：网页访问必须保留原始页面地址，不能转成 Raw 直链。 */
+  function classifyVisit(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_) {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (!INJECT_HOST.test(host) || /^api\.github\.com$/.test(host)) return false;
+    const path = parsed.pathname;
+    if (classify(url)) return false;                 // 文件类交给 ⚡ / ↓
+    if (SENSITIVE_PATH.test(path)) return false;    // 登录 / 账户 / 写操作页
+    if (FILE_EXT.test(path)) return false;          // 其他静态文件
+    if (path === '/' || path === '') return false;  // 站点首页
+    return true;
+  }
+
+  function boostableImage(src) {
+    let parsed;
+    try {
+      parsed = new URL(String(src || ''), location.href);
+    } catch (_) {
+      return '';
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+    const host = parsed.hostname.toLowerCase();
+    if (IMAGE_HOST.test(host)) return parsed.href;
+    if (INJECT_HOST.test(host) && /\/raw\//i.test(parsed.pathname)) return parsed.href;
+    return '';
+  }
+
+  /* 兼容保留的纯函数：旧版「加速本页」入口已移除，界面不再调用 */
+  function isRepoLikePage(url) {
+    try {
+      const parsed = new URL(String(url || location.href));
+      if (!INJECT_HOST.test(parsed.hostname)) return false;
+      const path = parsed.pathname.replace(/\/+$/, '');
+      if (!/^\/[^/]+\/[^/]+/.test(path)) return false;
+      return !/^\/(settings|notifications|marketplace|explore|topics|collections|sponsors|orgs|apps|login|join|search)(\/|$)/i.test(path);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function collect(forBadge) {
+    const limit = forBadge ? BADGE_LIMIT : COLLECT_LIMIT;
+    const anchors = document.querySelectorAll('a[href]');
+    const out = [];
+    const seen = Object.create(null);
+    for (let i = 0; i < anchors.length && out.length < limit; i += 1) {
+      const url = normalizeLink(anchors[i].getAttribute('href'), location.href);
+      if (!url || !classify(url) || seen[url]) continue;
+      seen[url] = true;
+      out.push(url);
+    }
+    return out;
+  }
+
+  /* 本页的站内网页链接（保留给旧宿主扫描接口；界面已不再暴露访问加速） */
+  function collectVisit() {
+    const anchors = document.querySelectorAll('a[href]');
+    const out = [];
+    const seen = Object.create(null);
+    for (let i = 0; i < anchors.length && out.length < COLLECT_LIMIT; i += 1) {
+      const url = normalizeLink(anchors[i].getAttribute('href'), location.href);
+      if (!url || !classifyVisit(url) || seen[url]) continue;
+      seen[url] = true;
+      out.push(url);
+    }
+    return out;
+  }
+
+  /* ---------------- DOM 构造 ---------------- */
+
+  function installSheet(shadow, cssText, kind) {
+    if (typeof CSSStyleSheet === 'function') {
+      try {
+        let sheet = kind === 'chip' ? sharedChipSheet : sharedBadgeSheet;
+        if (!sheet) {
+          sheet = new CSSStyleSheet();
+          sheet.replaceSync(cssText);
+          if (kind === 'chip') sharedChipSheet = sheet;
+          else sharedBadgeSheet = sheet;
+        }
+        shadow.adoptedStyleSheets = [sheet];
+        return;
+      } catch (_) {
+        /* 页面 CSP 或旧浏览器不支持构造样式表时退回 <style> */
+      }
+    }
+    const style = document.createElement('style');
+    style.textContent = cssText;
+    shadow.appendChild(style);
+  }
+
+  function makeHost(cssText, kind, className) {
+    const host = document.createElement('span');
+    host.className = className;
+    host.setAttribute('data-ctool', '1');
+    host.style.cssText = kind === 'chip'
+      ? 'position:fixed;right:20px;bottom:76px;z-index:2147483645;'
+      : 'display:inline-flex;vertical-align:middle;margin-left:6px;';
+    let shadow = null;
+    try {
+      shadow = host.attachShadow ? host.attachShadow({ mode: 'open' }) : null;
+    } catch (_) {
+      shadow = null;
+    }
+    if (!shadow) return null;
+    installSheet(shadow, cssText, kind);
+    return { host: host, shadow: shadow };
+  }
+
+  function english() {
+    const lang = (document.documentElement && document.documentElement.lang) || navigator.language || '';
+    return /^en/i.test(lang);
+  }
+
+  function dispatch(task) {
+    const fn = options && typeof options.openTask === 'function'
+      ? options.openTask
+      : (typeof window.__ctoolOpenTask === 'function' ? window.__ctoolOpenTask : null);
+    if (fn) {
+      try {
+        fn(task);
+        return;
+      } catch (_) {
+        /* 宿主不可用时继续走消息兜底 */
+      }
+    }
+    try {
+      window.postMessage({ type: 'ctool-page-task', task: task }, '*');
+    } catch (_) {
+      /* 页面禁止 postMessage 时静默失败，图标仍然可用作提示 */
+    }
+  }
+
+  function taskFor(url, action, source) {
+    return {
+      tool: 'github',
+      action: action,
+      text: url,
+      source: source,
+      pageUrl: location.href,
+      pageTitle: document.title || '',
+      createdAt: Date.now()
+    };
+  }
+
+  /* 统一的新标签页通道：宿主桥优先（扩展后台 chrome.tabs.create / 油猴 GM_openInTab），
+     没有宿主时页面内 window.open，最后退回 postMessage，绝不改写当前页面。 */
+  function openInNewTab(url) {
+    const target = String(url || '');
+    if (!/^https?:\/\//i.test(target)) return false;
+    const fn = options && typeof options.openNewTab === 'function' ? options.openNewTab : null;
+    if (fn) {
+      try {
+        if (fn(target) !== false) return true;
+      } catch (_) {
+        /* 宿主桥异常时继续走页面内兜底 */
+      }
+    }
+    try {
+      const opened = window.open(target, '_blank', 'noopener,noreferrer');
+      if (opened) return true;
+    } catch (_) {
+      /* 弹窗被拦截时继续走消息兜底 */
+    }
+    try {
+      window.postMessage({ type: 'ctool-open-new-tab', url: target }, '*');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /* 兼容旧宿主导出：网页访问加速已下线，保留空实现，不再发起任何跳转 / 任务 */
+  function triggerVisit() { return false; }
+
+  function makeBadge(url, kind) {
+    /* 旧版注入的 🌐 访问加速入口已屏蔽 */
+    if (kind === 'visit') return null;
+    const built = makeHost(BADGE_CSS, 'badge', HOST_CLASS);
+    if (!built) return null;
+    built.host.setAttribute('data-ctool-gh-url', url);
+    built.host.setAttribute('data-ctool-gh-kind', kind);
+    const en = english();
+    const wrap = document.createElement('span');
+    wrap.style.cssText = 'display:inline-flex;gap:3px;align-items:center;';
+    wrap.innerHTML =
+      '<button type="button" data-ctool-act="open" title="' +
+        (en ? 'CTool: open this link in the toolkit / 在工具中打开' : 'CTool：在工具中打开 / Open in CTool') +
+        '" aria-label="CTool open">' + ICON_BOLT + '</button>' +
+      '<button type="button" data-ctool-act="download" title="' +
+        (en ? 'CTool: accelerated download / 一键加速下载' : 'CTool：一键加速下载 / Accelerated download') +
+        '" aria-label="CTool download">' + ICON_DOWN + '</button>';
+    wrap.addEventListener('click', (event) => {
+      const button = event.target && event.target.closest ? event.target.closest('button[data-ctool-act]') : null;
+      if (!button) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const act = button.getAttribute('data-ctool-act');
+      dispatch(taskFor(url, act === 'download' ? 'quick-download' : 'speed', 'page-badge'));
+    });
+    built.shadow.appendChild(wrap);
+    return built.host;
+  }
+
+  function renderChip() {
+    const previous = document.getElementById(CHIP_ID);
+    const links = collect(false);
+    /* 没有可下载链接就不显示浮动条：旧版「加速访问此页面」入口已屏蔽 */
+    if (!links.length) {
+      if (previous) previous.remove();
+      return;
+    }
+    const en = english();
+    const label = en ? 'CTool · ' + links.length + ' links' : 'CTool · ' + links.length + ' 个链接';
+    /* DOM 频繁变化时复用已有 chip，避免闪烁；点击时再重新收集最新链接 */
+    if (previous && previous.getAttribute('data-ctool-label') === label) return;
+    if (previous) previous.remove();
+    const built = makeHost(CHIP_CSS, 'chip', HOST_CLASS);
+    if (!built) return;
+    built.host.id = CHIP_ID;
+    built.host.setAttribute('data-ctool-label', label);
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.title = en
+      ? 'Send all detected GitHub links on this page to CTool / 把本页链接批量传入 CTool'
+      : '把本页识别到的 GitHub 链接批量传入 CTool / Send detected links to CTool';
+    button.innerHTML = '<span class="dot"></span><span></span>';
+    button.lastChild.textContent = label;
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const fresh = collect(false);
+      dispatch(taskFor(fresh.length ? fresh.join('\n') : location.href, 'speed', 'page-chip'));
+    });
+
+    const wrap = document.createElement('span');
+    wrap.className = 'wrap';
+    wrap.appendChild(button);
+    built.shadow.appendChild(wrap);
+    (document.body || document.documentElement).appendChild(built.host);
+  }
+
+  function cleanupOrphans() {
+    const hosts = document.querySelectorAll('span.' + HOST_CLASS);
+    for (let i = 0; i < hosts.length; i += 1) {
+      const host = hosts[i];
+      if (host.id === CHIP_ID) continue;
+      /* 清理旧版残留的 🌐 网页访问图标 */
+      if (host.getAttribute('data-ctool-gh-kind') === 'visit') { host.remove(); continue; }
+      const prev = host.previousElementSibling;
+      if (!prev || prev.tagName !== 'A' || !prev.getAttribute('href')) host.remove();
+    }
+  }
+
+  function insertFor(anchor, url, kind) {
+    const next = anchor.nextElementSibling;
+    if (next && next.classList && next.classList.contains(HOST_CLASS)) {
+      if (next.getAttribute('data-ctool-gh-url') === url &&
+          next.getAttribute('data-ctool-gh-kind') === kind) return false;
+      next.remove();
+    }
+    const badge = makeBadge(url, kind);
+    if (!badge) return false;
+    if (anchor.insertAdjacentElement) anchor.insertAdjacentElement('afterend', badge);
+    else if (anchor.parentNode) anchor.parentNode.insertBefore(badge, anchor.nextSibling);
+    return true;
+  }
+
+  function injectBadges() {
+    const anchors = document.querySelectorAll('a[href]');
+    let fileCount = 0;
+    /* 只注入下载类图标；网页类链接改为由点击拦截统一在新标签页打开 */
+    for (let i = 0; i < anchors.length && fileCount < BADGE_LIMIT; i += 1) {
+      const anchor = anchors[i];
+      if (anchor.closest && anchor.closest('.' + HOST_CLASS)) continue;
+      const url = normalizeLink(anchor.getAttribute('href'), location.href);
+      if (!url || !classify(url)) continue;
+      if (insertFor(anchor, url, 'file')) fileCount += 1;
+    }
+    cleanupOrphans();
+  }
+
+  /* ---------------- 图片资源加速 ---------------- */
+
+  function applyImageBoost() {
+    if (!started || !enabled || !imageBoost) return;
+    const node = currentImageNode();
+    const images = document.querySelectorAll('img[src]');
+    const limit = Math.min(images.length, IMAGE_LIMIT);
+    for (let i = 0; i < limit; i += 1) {
+      const img = images[i];
+      const original = img.getAttribute('data-ctool-original-src');
+      const src = original || img.getAttribute('src') || '';
+      const absolute = boostableImage(src);
+      if (!absolute) continue;
+      if (!original) {
+        img.setAttribute('data-ctool-original-src', src);
+        const srcset = img.getAttribute('srcset');
+        if (srcset) {
+          img.setAttribute('data-ctool-original-srcset', srcset);
+          img.removeAttribute('srcset');
+        }
+      }
+      const mirrored = mirrorUrl(absolute, node);
+      if (mirrored && img.getAttribute('src') !== mirrored) img.setAttribute('src', mirrored);
+    }
+  }
+
+  function restoreImages() {
+    const images = document.querySelectorAll('img[data-ctool-original-src]');
+    for (let i = 0; i < images.length; i += 1) {
+      const img = images[i];
+      img.setAttribute('src', img.getAttribute('data-ctool-original-src'));
+      img.removeAttribute('data-ctool-original-src');
+      const srcset = img.getAttribute('data-ctool-original-srcset');
+      if (srcset) img.setAttribute('srcset', srcset);
+      img.removeAttribute('data-ctool-original-srcset');
+    }
+  }
+
+  /* ---------------- 站内链接新标签页（只拦截点击，不改 href） ---------------- */
+
+  /* GitHub 里有大量由 JS 接管的「伪链接」（下拉、Tab、复制、表单等），
+     这些必须留给 GitHub 自己处理，否则界面会被破坏。只放行普通导航链接。 */
+  function isPlainNavigationAnchor(anchor) {
+    if (!anchor || !anchor.getAttribute) return false;
+    if (anchor.getAttribute('download') || anchor.getAttribute('target')) return false;
+    /* 注意：data-hydro-click / -hmac 是 GitHub 的埋点属性，普通导航链接也有，不能跳过 */
+    const skipAttrs = [
+      'data-turbo-frame', 'data-turbo-action', 'data-turbo-method', 'data-method',
+      'data-remote', 'data-confirm', 'data-target', 'data-menu-button',
+      'data-hotkey', 'aria-expanded', 'data-toggle'
+    ];
+    for (let i = 0; i < skipAttrs.length; i += 1) {
+      if (anchor.hasAttribute && anchor.hasAttribute(skipAttrs[i])) return false;
+    }
+    const role = anchor.getAttribute('role');
+    if (role && /^(tab|button|menuitem|menuitemcheckbox|menuitemradio|switch|option)$/i.test(role)) return false;
+    if (anchor.closest && anchor.closest(
+      '[role="menu"], [role="dialog"], form, [contenteditable="true"], [data-ctool], [data-turbo-frame]'
+    )) return false;
+    return true;
+  }
+
+  function onDocumentClick(event) {
+    if (!started || !enabled || !newTabLinks) return;
+    if (event.defaultPrevented || (typeof event.button === 'number' && event.button !== 0)) return;
+    /* Ctrl / Cmd / Shift / Alt 点击由浏览器自己处理（本来就是新标签 / 新窗口 / 下载） */
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const target = event.target;
+    const anchor = target && target.closest ? target.closest('a[href]') : null;
+    if (!anchor || !isPlainNavigationAnchor(anchor)) return;
+    if (anchor.closest && anchor.closest('.' + HOST_CLASS)) return;
+    const url = normalizeLink(anchor.getAttribute('href'), location.href);
+    if (!url || !classifyVisit(url) || url === location.href) return;
+    /* 打开失败就不拦截，保留 GitHub 原有的同标签页跳转作为兜底 */
+    if (!openInNewTab(url)) return;
+    event.preventDefault();
+    /* 不 stopPropagation：GitHub 自己的点击处理（折叠、埋点等）照常执行；
+       Turbo 看到 defaultPrevented 后不会再劫持这次导航。 */
+  }
+
+  /* ---------------- 生命周期 ---------------- */
+
+  function removeAll() {
+    const hosts = document.querySelectorAll('span.' + HOST_CLASS);
+    for (let i = 0; i < hosts.length; i += 1) hosts[i].remove();
+    restoreImages();
+  }
+
+  function runScan() {
+    if (!started || !enabled) return;
+    if (!isInjectablePage(location.href)) {
+      removeAll();
+      return;
+    }
+    if (observer) observer.disconnect();
+    try {
+      injectBadges();
+      renderChip();
+      if (imageBoost) applyImageBoost();
+    } finally {
+      if (observer) {
+        try {
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+        } catch (_) {
+          /* DOM 根节点被替换时忽略 */
+        }
+      }
+    }
+  }
+
+  function scheduleScan() {
+    if (!started || !enabled) return;
+    if (scanTimer) clearTimeout(scanTimer);
+    scanTimer = setTimeout(runScan, RESCAN_DELAY);
+  }
+
+  function setEnabled(value) {
+    enabled = value !== false;
+    if (!enabled) removeAll();
+    else scheduleScan();
+  }
+
+  function setNewTabLinks(value) {
+    newTabLinks = value !== false;
+  }
+
+  /* 兼容旧宿主：自动镜像代理已下线，空实现避免旧代码调用时抛错 */
+  function setAutoVisit() {
+    return false;
+  }
+
+  function setImageBoost(value) {
+    imageBoost = value === true;
+    if (!imageBoost) restoreImages();
+    else if (enabled) applyImageBoost();
+  }
+
+  function refresh() {
+    scheduleScan();
+  }
+
+  function install(opts) {
+    options = opts || {};
+    enabled = typeof options.getEnabled === 'function' ? options.getEnabled() !== false : true;
+    newTabLinks = typeof options.getNewTabLinks === 'function' ? options.getNewTabLinks() !== false : true;
+    imageBoost = typeof options.getImageBoost === 'function' ? options.getImageBoost() === true : false;
+    started = true;
+    document.addEventListener('click', onDocumentClick, true);
+    /* 非 GitHub 页面完全不启动观察器 / 定时器，避免给普通网页增加开销 */
+    if (!isInjectablePage(location.href)) return;
+    lastHref = location.href;
+    if (typeof MutationObserver === 'function') {
+      observer = new MutationObserver(scheduleScan);
+      try {
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+      } catch (_) {
+        observer = null;
+      }
+    }
+    window.addEventListener('popstate', scheduleScan);
+    navTimer = setInterval(() => {
+      /* GitHub 使用 Turbo 做站内跳转，不一定触发 popstate */
+      if (location.href !== lastHref) {
+        lastHref = location.href;
+        scheduleScan();
+      }
+    }, 900);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) scheduleScan();
+    });
+    if (enabled) scheduleScan();
+  }
+
+  /* 供宿主在页面卸载 / 热更新时调用 */
+  function destroy() {
+    started = false;
+    if (observer) observer.disconnect();
+    if (scanTimer) clearTimeout(scanTimer);
+    if (navTimer) clearInterval(navTimer);
+    removeAll();
+  }
+
+  window.CToolPageGithub = {
+    install: install,
+    destroy: destroy,
+    collect: collect,
+    collectVisit: collectVisit,
+    setEnabled: setEnabled,
+    setAutoVisit: setAutoVisit,
+    setNewTabLinks: setNewTabLinks,
+    setImageBoost: setImageBoost,
+    openInNewTab: openInNewTab,
+    isPlainNavigationAnchor: isPlainNavigationAnchor,
+    refresh: refresh,
+    isGithubPage: isGithubPage,
+    isInjectablePage: isInjectablePage,
+    normalizeLink: normalizeLink,
+    classify: classify,
+    classifyVisit: classifyVisit,
+    boostableImage: boostableImage,
+    mirrorUrl: mirrorUrl,
+    visitUrl: visitUrl,
+    normalizeVisitHost: normalizeVisitHost,
+    currentVisitMirror: currentVisitMirror,
+    currentImageNode: currentImageNode,
+    isRepoLikePage: isRepoLikePage,
+    taskFor: taskFor,
+    triggerVisit: triggerVisit,
+    limits: {
+      badge: BADGE_LIMIT, visit: VISIT_LIMIT, collect: COLLECT_LIMIT, image: IMAGE_LIMIT,
+      defaultVisitHost: DEFAULT_VISIT_HOST, defaultImageNode: DEFAULT_IMAGE_NODE
+    }
+  };
+})();
+
+
 (function userscriptMain() {
   'use strict';
 
@@ -3875,6 +4621,123 @@ html[data-theme="dark"] .regex-preview mark {
   line-height: 1.55;
 }
 
+.ai-provider-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ai-provider-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  color: var(--text-2);
+  text-align: left;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+
+.ai-provider-btn strong {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ai-provider-btn small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.ai-provider-btn:hover {
+  border-color: var(--border-strong);
+}
+
+.ai-provider-btn.active {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.ai-zen-panel,
+.ai-custom-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ai-zen-panel[hidden],
+.ai-custom-panel[hidden] {
+  display: none;
+}
+
+.ai-zen-note {
+  padding: 10px 12px;
+  color: var(--text-2);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  border-radius: 9px;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.ai-zen-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ai-zen-row .select {
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-zen-row .btn {
+  flex: none;
+}
+
+.ai-advanced {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.ai-advanced > summary {
+  padding: 9px 12px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+  list-style: none;
+}
+
+.ai-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ai-advanced > summary::before {
+  content: '\\25B8';
+  display: inline-block;
+  margin-right: 7px;
+  color: var(--muted);
+  transition: transform .15s ease;
+}
+
+.ai-advanced[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.ai-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+
 /* ==========================================================================
    Markdown 预览
    ========================================================================== */
@@ -5465,6 +6328,352 @@ html[data-theme="dark"] .regex-preview mark {
   }
 }
 
+/* ===== GitHub 加速工具 ===== */
+/* 精简版：主操作行、折叠设置区 */
+.gh-main-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.gh-quick-hint {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.gh-details {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+.gh-details + .gh-details { margin-top: 12px; }
+.gh-details > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+.gh-details > summary::-webkit-details-marker { display: none; }
+.gh-details > summary::before {
+  content: '▸';
+  color: var(--muted);
+  font-size: 12px;
+}
+.gh-details[open] > summary::before { content: '▾'; }
+.gh-details > .card-body { padding: 0 16px 16px; }
+.gh-mini-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.gh-page .gh-input {
+  min-height: 92px;
+}
+.gh-input-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.gh-input-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gh-notice {
+  margin-top: 12px;
+}
+.gh-page-switch {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.55;
+  cursor: pointer;
+}
+.gh-page-switch input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.gh-inline-notice {
+  margin-top: 10px;
+}
+.gh-results,
+.gh-derived,
+.gh-node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.gh-empty {
+  padding: 26px 18px;
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface-2);
+  font-size: 13px;
+}
+.gh-group {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+}
+.gh-group + .gh-group {
+  margin-top: 12px;
+}
+.gh-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.gh-origin,
+.gh-filename,
+.gh-link-url,
+.gh-derived-url,
+.gh-node-info code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.gh-origin {
+  min-width: 0;
+  flex: 1 1 240px;
+}
+.gh-filename {
+  color: var(--muted);
+}
+.gh-hint {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.gh-link-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.gh-link-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.gh-link-meta {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gh-node-name {
+  font-size: 13px;
+  color: var(--text);
+}
+.gh-region,
+.gh-node-builtin {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.gh-probe {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.gh-probe.ok {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.gh-probe.bad {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.gh-fast {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.gh-link-url {
+  grid-column: 1;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  line-height: 1.6;
+}
+.gh-link-actions {
+  grid-column: 2;
+  display: flex;
+  gap: 6px;
+}
+.gh-expand {
+  margin-top: 10px;
+}
+.gh-derived-row {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+}
+.gh-derived-row:last-child {
+  border-bottom: 0;
+}
+.gh-derived-label {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.gh-add-row {
+  display: flex;
+  gap: 8px;
+  margin: 14px 0;
+}
+.gh-add-row .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.gh-node-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.gh-node-row:last-child {
+  border-bottom: 0;
+}
+.gh-node-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.gh-node-check input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.gh-node-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.gh-node-info strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.gh-help-lead {
+  margin: 0 0 14px;
+  color: var(--text-2);
+  font-size: 13.5px;
+}
+.gh-command {
+  margin-bottom: 14px;
+}
+.gh-command-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.gh-command code {
+  display: block;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.gh-help ol {
+  margin: 0 0 4px;
+  padding-left: 20px;
+  color: var(--text-2);
+  font-size: 13.5px;
+  line-height: 1.85;
+}
+.compact-mode .gh-derived-row,
+.compact-mode .gh-link-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+.compact-mode .gh-link-url,
+.compact-mode .gh-link-meta,
+.compact-mode .gh-link-actions {
+  grid-column: 1;
+}
+.compact-mode .gh-node-row {
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+}
+@media (max-width: 720px) {
+  .gh-derived-row,
+  .gh-link-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .gh-link-url,
+  .gh-link-meta,
+  .gh-link-actions {
+    grid-column: 1;
+  }
+  .gh-node-row {
+    grid-template-columns: 26px minmax(0, 1fr) auto;
+  }
+  .gh-node-row .badge,
+  .gh-node-row .gh-probe {
+    display: none;
+  }
+  .gh-add-row {
+    flex-direction: column;
+  }
+}
+
 </style>
 
 <script>
@@ -5531,6 +6740,51 @@ html[data-theme="dark"] .regex-preview mark {
       try { parent.postMessage({ type: 'ctool-panel-close' }, '*'); } catch (err) {}
     }
   }, true);
+
+  /* 5) AI 请求桥：iframe 内 fetch 受目标站点 CORS 限制，交给宿主 GM_xmlhttpRequest */
+  var aiSeq = 0;
+  var aiPending = {};
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.type !== 'ctool-ai-fetch-result') return;
+    var done = aiPending[d.id];
+    if (!done) return;
+    delete aiPending[d.id];
+    done(d);
+  });
+  var CT = (window.CTool = window.CTool || {});
+  CT.aiBridge = true;
+  CT.aiFetch = function (url, options) {
+    options = options || {};
+    var id = 'ai' + (++aiSeq) + '_' + Date.now();
+    return new Promise(function (resolve, reject) {
+      aiPending[id] = function (d) {
+        if (d.error && !d.text) { reject(new Error(d.error)); return; }
+        var text = typeof d.text === 'string' ? d.text : '';
+        resolve({
+          ok: d.ok === true,
+          status: Number(d.status) || 0,
+          statusText: String(d.statusText || ''),
+          body: null,
+          text: function () { return Promise.resolve(text); },
+          json: function () { return Promise.resolve(JSON.parse(text || '{}')); }
+        });
+      };
+      try {
+        parent.postMessage({
+          type: 'ctool-ai-fetch',
+          id: id,
+          url: url,
+          method: options.method || 'GET',
+          headers: options.headers || {},
+          body: options.body || null
+        }, '*');
+      } catch (err) {
+        delete aiPending[id];
+        reject(err);
+      }
+    });
+  };
 })();
 </script>
 </head>
@@ -5565,7 +6819,7 @@ html[data-theme="dark"] .regex-preview mark {
       <nav class="tool-nav" id="tool-nav" aria-label="全部工具"></nav>
 
       <div class="sidebar-footer">
-        <div class="privacy-line"><span class="dot"></span>所有数据仅在本地处理</div>
+        <div class="privacy-line"><span class="dot"></span>除 AI 问答外均本地处理</div>
         <div class="sidebar-version" id="sidebar-version">CTOOL v1.4.0 · OFFLINE</div>
       </div>
     </aside>
@@ -5634,7 +6888,7 @@ html[data-theme="dark"] .regex-preview mark {
       <div class="tool-content" id="tool-content"></div>
 
       <footer class="main-footer">
-        所有数据仅在浏览器本地处理，不上传服务器 · CTool 万能工具箱
+        除 AI 问答与镜像访问外，所有数据仅在浏览器本地处理 · CTool 万能工具箱
       </footer>
     </main>
   </div>
@@ -7182,6 +8436,47 @@ html[data-theme="dark"] .regex-preview mark {
     '你': 'You',
     '助手': 'Assistant',
 
+    /* AI 问答 · OpenCode Zen 零配置 */
+    '零配置 · 免费模型': 'Zero config · free models',
+    '自定义接口': 'Custom endpoint',
+    'OpenAI 兼容 / 本地模型': 'OpenAI compatible / local model',
+    '已内置 OpenCode Zen 免费模型，打开即可提问，无需接口地址或 API Key。免费模型池会轮换，请求失败时自动切换其他模型。': 'Free OpenCode Zen models are built in — just ask, no base URL or API key needed. The free pool rotates, and failed requests automatically switch to another model.',
+    '免费模型': 'Free model',
+    '刷新模型': 'Refresh models',
+    '列表来自 Zen 的 /models 接口，点「刷新模型」获取最新免费池。': 'The list comes from the Zen /models endpoint. Click "Refresh models" to get the latest free pool.',
+    '支持 OpenAI 兼容接口，例如 https://api.openai.com/v1 或本地 Ollama 服务。': 'Any OpenAI-compatible endpoint, e.g. https://api.openai.com/v1 or a local Ollama server.',
+    'Zen API Key（可选）': 'Zen API key (optional)',
+    '留空即匿名免费使用': 'Leave empty for anonymous free usage',
+    '匿名免费额度不可用时，可填入自己的 OpenCode Zen Key 提升稳定性。': 'Add your own OpenCode Zen key if the anonymous free quota is unavailable.',
+    '高级设置': 'Advanced settings',
+    '油猴脚本版使用完整响应': 'The userscript build uses full responses',
+    '逐字显示回答，适合长文本': 'Show the answer as it streams in, ideal for long text',
+    '设置会自动保存在本机 localStorage，无需点击保存；API Key 不会同步或上传到其他服务。': 'Settings are saved automatically to local storage — no Save button needed. API keys are never synced or uploaded elsewhere.',
+    '修改后立即生效': 'Changes apply immediately',
+    '零配置 · 就绪': 'Zero config · ready',
+    'Zen Key · 就绪': 'Zen key · ready',
+    '直接输入问题，无需任何配置': 'Just ask — no setup required',
+    '默认使用 OpenCode Zen 免费模型；也可以切换到自己的接口。': 'Free OpenCode Zen models are used by default; you can switch to your own endpoint.',
+    'AI 问答会把你的问题发送到 OpenCode Zen（或你配置的服务）；Zen 不可用时会自动回退到 Pollinations 公共端点，均可在高级设置中关闭。免费模型的提示词可能用于改进模型，请勿提交个人或机密信息；其余工具仍然完全离线。': 'AI chat sends your question to OpenCode Zen (or the endpoint you configured) and falls back to the public Pollinations endpoint when Zen is unavailable; the fallback can be turned off in Advanced settings. Free-model prompts may be used to improve models, so avoid personal or confidential data. Every other tool stays offline.',
+    'Zen 不可用时自动使用公共备用端点': 'Auto-fallback to a public endpoint when Zen is unavailable',
+    '内置 Pollinations 公共端点，同样无需 API Key；提示词会发送给第三方服务。': 'Built-in public Pollinations endpoint, also keyless; prompts are sent to that third-party service.',
+    '正在切换公共备用端点…': 'Switching to the public fallback endpoint…',
+    '（公共备用端点）': ' (public fallback)',
+    '公共备用端点也未能响应，请稍后重试。': 'The public fallback endpoint did not respond either. Please try again later.',
+    '正在切换模型：': 'Switching model: ',
+    '正在获取模型列表…': 'Fetching model list…',
+    '获取失败：': 'Fetch failed: ',
+    '暂无可用的免费模型': 'No free models available',
+    'OpenCode Zen 免费模型当前不可用。可稍后重试，或在高级设置中填入自己的 Zen API Key，也可以切换到自定义接口。': 'OpenCode Zen free models are currently unavailable. Try again later, add your own Zen API key in Advanced settings, or switch to a custom endpoint.',
+    '尚未配置 AI 接口，请先填写接口地址和模型。': 'The custom endpoint is not configured. Enter a base URL and model first.',
+    '尚未配置 AI 接口。请先在左侧填写接口地址和模型，或切回 OpenCode Zen 免配置使用。': 'The custom endpoint is not configured. Fill in the base URL and model on the left, or switch back to zero-config OpenCode Zen.',
+    '正在请求…': 'Requesting…',
+    '正在接收流式回答…': 'Streaming answer…',
+    '✓ 已更新 {count} 个免费模型': '✓ Updated {count} free models',
+    '内置 OpenCode Zen 免费模型，无需配置即可问答；也可切换自定义接口。': 'Free OpenCode Zen models are built in — no setup needed. You can also switch to a custom endpoint.',
+    '除 AI 问答外均本地处理': 'Everything local except AI chat',
+    '除 AI 问答与镜像访问外，所有数据仅在浏览器本地处理 · CTool 万能工具箱': 'Everything stays in your browser except AI chat and mirror visits · CTool Toolkit',
+
     /* 工作台 / 工作流 */
     '收藏的工具会显示在这里': 'Starred tools appear here',
     '选择职业后会自动推荐适合的工具与工作流。': 'Pick a profession to get tailored tools and workflows.',
@@ -7887,8 +9182,239 @@ html[data-theme="dark"] .regex-preview mark {
     '有定制开发需求、想问报价，或者只是想反馈工具箱的问题，都可以通过下面两种方式联系我。': 'For a custom project, a quote, or just feedback about the toolbox, reach me through either channel below.',
     '点击「复制」即可复制，也可直接选中文字；联系方式只写在本页，不会上传。': 'Click Copy, or select the text directly. These contact details live only on this page and are never uploaded.',
     '发邮件': 'Send an email',
-    '使用系统默认邮件客户端': 'Uses your system default mail client'
+    '使用系统默认邮件客户端': 'Uses your system default mail client',
+    /* GitHub 加速工具 */
+    'GitHub 加速': 'GitHub accelerator',
+    '把 GitHub / Raw / Release / 源码包 / 克隆地址转换成镜像直链，内置公益节点、自定义节点、并发测速与 git clone 加速命令。': 'Turn GitHub / Raw / Release / archive / clone URLs into mirror links, with built-in public mirrors, custom nodes, concurrent speed tests and git clone acceleration commands.',
+    'GitHub 链接': 'GitHub URL',
+    '本地转换': 'Local conversion',
+    '粘贴 GitHub 链接，一行一个（最多 20 行）…': 'Paste GitHub URLs, one per line (up to 20)…',
+    '从当前页面获取': 'Get from current page',
+    '支持 Release 附件、源码包、Raw 文件、Blob / 仓库页、Git 克隆地址等。仓库页会自动派生源码包与克隆命令；所有转换只在本机完成，默认不会联网。': 'Supports release assets, source archives, raw files, blob / repository pages and git clone URLs. Repository pages get derived archive and clone URLs. All conversions happen locally; nothing hits the network by default.',
+    '生成加速直链': 'Generate mirror links',
+    '测速并选最快': 'Test speed & pick fastest',
+    '复制全部直链': 'Copy all links',
+    '加速直链': 'Mirror links',
+    '镜像节点': 'Mirror nodes',
+    '命令与说明': 'Commands & notes',
+    '加速结果': 'Results',
+    '尚未生成': 'Nothing generated yet',
+    '粘贴链接后点击「生成加速直链」，结果会显示在这里。': 'Paste a URL and click "Generate mirror links"; results appear here.',
+    '复制最快直链': 'Copy fastest link',
+    '下载最快直链': 'Download fastest link',
+    '派生链接': 'Derived URLs',
+    '可继续生成加速直链': 'Can be accelerated too',
+    '收起镜像': 'Hide mirrors',
+    '首选': 'Preferred',
+    '未测速': 'Not tested',
+    '不可用': 'Unavailable',
+    '内置节点为第三方公益镜像，可能随时失效或变更；测速会向这些站点发送一次 HEAD 请求（包含你的完整链接），不点击「测速并选最快」则不会联网。': 'Built-in nodes are third-party public mirrors and may stop working at any time. A speed test sends one HEAD request to each of them (including your full URL); nothing touches the network unless you click "Test speed & pick fastest".',
+    '自定义镜像前缀，如 https://mirror.example.com/': 'Custom mirror prefix, e.g. https://mirror.example.com/',
+    '添加节点': 'Add node',
+    '启用全部': 'Enable all',
+    '恢复默认': 'Restore defaults',
+    '启用节点': 'Enable node',
+    '内置': 'Built-in',
+    '自定义': 'Custom',
+    '多国': 'Multi-region',
+    '英国': 'United Kingdom',
+    '美国': 'United States',
+    '中国香港': 'Hong Kong, China',
+    '日本': 'Japan',
+    'git clone 加速': 'git clone acceleration',
+    '选一个镜像前缀，把仓库地址交给它代理；下面两条命令基于当前首选节点生成。': 'Pick a mirror prefix to proxy your repository URL. Both commands below are built from the current preferred node.',
+    '克隆单个仓库': 'Clone a single repository',
+    '全局替换（所有 GitHub 仓库）': 'Global rewrite (all GitHub repos)',
+    '全局替换会影响所有 git 操作；恢复命令：git config --global --unset url.<前缀>.insteadOf': 'A global rewrite affects every git operation. To undo: git config --global --unset url.<prefix>.insteadOf',
+    '使用说明与限制': 'Usage & limitations',
+    '粘贴一个 GitHub 直链（Release 附件、源码包、Raw 文件等），点击「生成加速直链」。': 'Paste a direct GitHub URL (release asset, source archive, raw file, etc.) and click "Generate mirror links".',
+    '结果按启用节点逐条列出，可复制、打开或交付原生下载；批量输入时每组默认只显示首选节点，点「展开全部镜像」查看其余。': 'Results are listed per enabled node and can be copied, opened or handed to the native downloader. With multiple URLs each group shows only the preferred node until you click "Show all mirrors".',
+    '点击「测速并选最快」才发起 HEAD 探测，按延迟排序；结果在本机缓存 5 分钟，期间直接复用。': 'Only "Test speed & pick fastest" sends HEAD probes, then sorts by latency. Results are cached locally for 5 minutes and reused during that window.',
+    '「下载」使用原生 a[download] 点击，不走 Blob 中转，方便 Gopeed 等下载器接管；跨域时浏览器可能改为打开新标签页，此时用「复制」交给下载工具更稳。': '"Download" uses a native a[download] click with no Blob relay, so tools such as Gopeed can intercept it. Cross-origin links may open a new tab instead; in that case copying the URL into your downloader is more reliable.',
+    '镜像是第三方服务：使用加速链接或测速时，对方能看到完整的 GitHub 链接（可能含私有仓库令牌参数）。私有仓库、带鉴权参数的链接请勿使用第三方镜像。镜像可用性、速度与文件内容由第三方决定，本工具不保证，也不上传任何输入到 CTool 的服务器（事实上没有服务器）。': 'Mirrors are third-party services: opening an accelerated link or running a speed test reveals the full GitHub URL to them (including any token query parameters). Never use third-party mirrors for private repositories or authenticated URLs. Availability, speed and file content are controlled by the mirror operator, not guaranteed by this tool. Nothing is uploaded to a CTool server — there is no server.',
+    'Release 附件': 'Release asset',
+    '源码归档': 'Source archive',
+    'Raw 原始文件': 'Raw file',
+    'Git LFS 文件': 'Git LFS object',
+    'Patch / Diff': 'Patch / Diff',
+    '仓库文件': 'Repository file',
+    '目录页': 'Directory page',
+    'Release 页面': 'Release page',
+    'Gist 链接': 'Gist URL',
+    '仓库主页': 'Repository home',
+    '其他 GitHub 链接': 'Other GitHub URL',
+    '原始文件直链 (Raw)': 'Raw file URL',
+    '源码包 ZIP · main': 'Source ZIP · main',
+    '源码包 ZIP · master': 'Source ZIP · master',
+    '源码包 TAR.GZ · main': 'Source TAR.GZ · main',
+    '源码包 ZIP · HEAD': 'Source ZIP · HEAD',
+    '仓库克隆地址': 'Clone URL',
+    '仓库主页不是文件直链。下方已派生源码包与克隆地址，可直接加速；也可以粘贴具体的 Release 附件链接。': 'A repository page is not a direct file URL. Archive and clone URLs are derived below and can be accelerated directly; you can also paste a specific release asset URL.',
+    '文件查看页已自动转换为 Raw 直链；若分支名本身含斜杠，请手动修正派生链接。': 'The blob page was converted to a raw URL. If the branch name contains slashes, fix the derived URL manually.',
+    '目录页不能直接下载，请改用源码包或具体文件链接。': 'A directory page cannot be downloaded directly. Use a source archive or a specific file URL instead.',
+    'Release 列表页不能直接下载，请复制具体附件的下载直链（含 /releases/download/）。': 'A release listing cannot be downloaded directly. Copy the direct asset URL (the one containing /releases/download/).',
+    'Gist 链接按原样拼接镜像前缀，Raw 链接的加速效果最好。': 'Gist URLs are prefixed as-is; raw URLs work best with mirrors.',
+    '未识别的 GitHub 链接类型，将按「镜像前缀 + 原链接」原样转换。': 'Unrecognized GitHub URL type; it will be converted as "mirror prefix + original URL".',
+    '没有启用的镜像节点，请先在「镜像节点」中启用': 'No mirror nodes are enabled. Enable at least one under "Mirror nodes".',
+    '请先生成加速直链': 'Generate mirror links first',
+    '请输入有效的镜像地址（http/https）': 'Enter a valid http/https mirror URL',
+    '该镜像节点已存在': 'That mirror node already exists',
+    '✓ 已添加自定义节点': '✓ Custom node added',
+    '✓ 已删除自定义节点': '✓ Custom node removed',
+    '✓ 已启用全部节点': '✓ All nodes enabled',
+    '✓ 已恢复默认节点': '✓ Default nodes restored',
+    '✓ 已载入链接': '✓ URL loaded',
+    '✓ 已载入当前页面链接': '✓ Current page URL loaded',
+    '当前页面不是 GitHub 链接，请手动粘贴': 'The current page is not a GitHub URL; paste one manually',
+    '测速中…': 'Testing…',
+    '测速完成，已按延迟排序': 'Speed test complete, sorted by latency',
+    '请先在「镜像节点」中启用至少一个节点': 'Enable at least one node under "Mirror nodes" first',
+    '该节点为查询串式前缀，不支持全局 insteadOf 配置': 'This node uses a query-string prefix and does not support a global insteadOf rewrite',
+    /* GitHub 页面联动 */
+    '扫描本页链接': 'Scan this page',
+    '在 GitHub 页面链接旁显示 CTool 加速图标（⚡ 打开工具 / ↓ 一键下载）': 'Show CTool accelerator icons next to links on GitHub (⚡ open tool / ↓ one-click download)',
+    '页面上的 GitHub 链接会自动出现 ⚡ / ↓ 图标：点击即可把链接传进本工具并生成直链，↓ 还会直接发起下载，无需复制粘贴；右下角的小胶囊可一次载入本页全部链接。页面识别与开关只在本机完成，不联网、不改动原链接。': 'Detected GitHub links get ⚡ / ↓ icons right on the page: a click sends the URL into this tool and builds mirror links, while ↓ also starts the download — no copy & paste. The floating chip at the bottom right loads every link on the page at once. Detection and the toggle stay on your device: no network requests and no changes to the original links.',
+    '不想复制粘贴时，直接在 GitHub 页面点链接旁的 ⚡（传参到工具）或 ↓（传参并自动下载）；也可右键链接使用 CTool 菜单，或在输入框点「扫描本页链接」批量载入。': 'To skip copy & paste, click ⚡ (send the URL to the tool) or ↓ (send it and start the download) next to a link on GitHub. You can also right-click a link and use the CTool menu, or click "Scan this page" to batch-load links.',
+    '正在扫描当前页面…': 'Scanning the current page…',
+    '本页没有识别到可加速的 GitHub 链接': 'No accelerator-ready GitHub links found on this page',
+    '未能读取当前页面，请在 GitHub 页面点击链接旁的图标': 'Cannot read the current page; use the icon next to a link on GitHub',
+    '✓ 已开启页面加速图标': '✓ Page accelerator icons enabled',
+    '✓ 已关闭页面加速图标': '✓ Page accelerator icons disabled',
+    '✓ 已用首选节点发起下载': '✓ Download started through the preferred node',
+    '没有可用的镜像直链，请检查节点设置': 'No mirror links available; check your node settings',
+    '已载入页面链接': 'Page link loaded',
+    /* 以下为历史版本「网页访问加速」词条的兼容保留，当前界面已不再使用 */
+    'GitHub 文件下载走实测可用的代理节点生成加速直链；所有结果与 GitHub 站内链接默认新标签页打开，网页访问加速已下线。': 'GitHub downloads use retested proxy nodes for accelerated links. Every result and GitHub internal link opens in a new tab; page visit acceleration has been removed.',
+    '访问加速': 'Browse acceleration',
+    'GitHub 网页访问加速': 'GitHub page acceleration',
+    '浏览器打开': 'Opens in browser',
+    '网页访问链接保留原始页面地址（仓库 / 文件 / 目录 / Release / Issues / Gist 等），用镜像前缀在浏览器中打开；与「加速直链」不同，它不会把文件查看页转换成 Raw 文件。': 'Visit links keep the original page address (repository / file / directory / release / issue / gist, etc.) and open it through a mirror prefix. Unlike "Mirror links", a blob page is not rewritten into a raw file URL.',
+    '访问节点': 'Mirror node',
+    '跟随测速首选节点': 'Follow fastest node',
+    '生成访问链接': 'Generate visit links',
+    '加速访问当前页面': 'Accelerate current page',
+    '打开首选访问链接': 'Open preferred link',
+    '扫描本页网页链接': 'Scan page links',
+    '复制全部访问链接': 'Copy all visit links',
+    '页面浏览增强': 'Page browsing',
+    '本机开关': 'Local toggles',
+    '点击 GitHub 站内网页链接时自动用镜像打开（只拦截点击，不改写原链接）': 'Open GitHub page links through a mirror automatically (intercepts clicks only; original links are untouched)',
+    '加速页面内 GitHub 图片 / Raw 资源（README、Issue 里的图床图片走镜像加载）': 'Accelerate GitHub images / raw assets on the page (README and issue images load through the mirror)',
+    '网页镜像只适合浏览公开页面：镜像站点拿不到 github.com 的登录态与 Cookie，登录后操作、表单提交、私有仓库均不可用；部分节点不返回 HTML 页面，遇到空白 / 403 请换节点或关闭开关。开启「图片资源加速」后浏览器会向所选镜像站点请求图片，请自行确认可信度。': 'Mirrored pages are for browsing public content only: a third-party mirror has no github.com session or cookies, so signed-in actions, form submissions and private repositories will not work. Some nodes do not return HTML at all — switch nodes or turn the toggle off if you see a blank page or 403. Enabling image acceleration makes the browser request images from the selected mirror; make sure you trust it.',
+    '这是文件直链，建议改用「加速直链」下载': 'This is a direct file URL; use "Mirror links" to download it instead',
+    '在上方输入框粘贴 GitHub 网页链接，点击「生成访问链接」，或直接点「加速访问当前页面」。': 'Paste a GitHub page URL above and click "Generate visit links", or click "Accelerate current page" directly.',
+    '不想复制粘贴时，直接在 GitHub 页面点链接旁的 ⚡（传参到工具）、↓（传参并自动下载）或 🌐（用镜像打开网页）；也可右键链接使用 CTool 菜单，或在输入框点「扫描本页链接」批量载入。': 'To skip copy & paste, click ⚡ (send the URL to the tool), ↓ (send it and start the download) or 🌐 (open the page through a mirror) next to a link on GitHub. You can also right-click a link and use the CTool menu, or click "Scan this page" to batch-load links.',
+    '「访问加速」页把网页链接（仓库 / 文件 / Release / Issues / Gist）用镜像前缀在浏览器打开，可指定访问节点、扫描本页网页链接，并开启点击站内链接自动代理与图片资源加速。': 'The "Browse acceleration" tab opens page URLs (repository / file / release / issue / gist) through a mirror prefix. You can pick a node, scan page links and enable automatic link proxying plus image acceleration.',
+    '网页代理只适用于浏览公开页面：登录态、Cookie、表单提交与私有仓库无法通过第三方镜像使用；部分节点不返回 HTML，遇到空白 / 403 请换节点或关闭开关。': 'Web proxying is for public pages only: sessions, cookies, form submissions and private repositories do not work through third-party mirrors. Some nodes do not return HTML; switch nodes or turn the toggle off on a blank page / 403.',
+    '请先输入 GitHub 网页链接': 'Enter a GitHub page URL first',
+    '请先生成访问链接': 'Generate visit links first',
+    '✓ 已切换访问节点': '✓ Mirror node switched',
+    '✓ 已保存页面浏览设置': '✓ Page browsing settings saved',
+    '✓ 已请求加速访问当前页面': '✓ Requested acceleration for the current page',
+    '✓ 已用镜像打开页面': '✓ Page opened through a mirror',
+    '本页没有识别到可加速访问的网页链接': 'No browsable GitHub page links found here',
+    /* 网页镜像站与下载代理节点分离 */
+    '网页浏览用「同构镜像站」：把链接里的 github.com 换成镜像域名，由镜像站返回完整的 GitHub 页面；下载用的 gh-proxy 一类文件代理只转发文件字节、不返回网页 HTML，两类域名完全独立、不会混用。所有访问链接与镜像页面默认在新标签页打开。': 'Website clones work by replacing github.com with the mirror domain and serve full GitHub pages. File proxies such as gh-proxy only relay file bytes and never return page HTML — the two domain pools are completely separate. Every visit link and mirrored page opens in a new tab by default.',
+    '网页镜像站': 'Website mirror',
+    '打开镜像首页': 'Open mirror home',
+    '自定义镜像域名，如 mirror.example.com': 'Custom mirror domain, e.g. mirror.example.com',
+    '添加镜像站': 'Add mirror site',
+    '网页链接的 🌐 图标与自动代理走上面的「网页镜像站」；图片 / Raw 资源属于文件，走「镜像节点」里的下载代理首选节点。两者分开配置，互不干扰。': 'The 🌐 icons and automatic link proxying use the website mirror above; images / raw assets are files and use the preferred download proxy from "Mirror nodes". The two are configured independently.',
+    '同构镜像站只适合浏览公开页面：它拿不到 github.com 的登录态与 Cookie，登录后操作、表单提交、私有仓库均不可用；gist.github.com 等子域暂不支持域名替换，会保留原链接。部分镜像站可能失效，遇到空白 / 403 请更换镜像站。开启「图片资源加速」后浏览器会向所选下载代理请求图片，请自行确认可信度。': 'Website mirrors are for public browsing only: they have no github.com session or cookies, so signed-in actions, form submissions and private repositories do not work. Subdomains such as gist.github.com cannot be domain-swapped and keep their original URL. Mirrors may go offline — switch sites on a blank page / 403. Image acceleration makes the browser request images from the selected download proxy; make sure you trust it.',
+    '「访问加速」页把网页链接（仓库 / 文件 / Release / Issues）中的 github.com 替换成同构镜像站域名后在新标签页打开，可指定镜像站、扫描本页网页链接，并开启点击站内链接自动代理与图片资源加速；下载代理节点不参与网页浏览。': 'The "Browse acceleration" tab swaps github.com for a website mirror domain in page URLs (repo / file / release / issue) and opens them in a new tab. You can pick a mirror site, scan page links and enable automatic link proxying plus image acceleration. Download proxy nodes are not used for page browsing.',
+    '网页镜像只适用于浏览公开页面：登录态、Cookie、表单提交与私有仓库无法通过第三方镜像使用；gist.github.com 等子域不支持域名替换，会保留原链接；镜像站失效时请更换镜像站。': 'Website mirrors are for public pages only: sessions, cookies, form submissions and private repositories do not work through them. Subdomains such as gist.github.com keep their original URL; switch sites if a mirror goes offline.',
+    '默认镜像站': 'Default mirror site',
+    '完整同构镜像 · 实测可浏览仓库 / 文件 / Issues': 'Full GitHub clone · verified for repo / file / issue pages',
+    '轻量浏览镜像 · 支持仓库搜索': 'Lightweight mirror · repository search',
+    '浏览与 Issue · 操作逻辑与官网一致': 'Browsing & issues · same layout as GitHub',
+    'Markdown 文档渲染较快': 'Fast Markdown rendering',
+    '备用入口': 'Fallback entry',
+    '请输入有效的镜像站域名': 'Enter a valid mirror domain',
+    '该镜像站已存在': 'That mirror site already exists',
+    '✓ 已添加并切换到该镜像站': '✓ Added and switched to that mirror site',
+    '✓ 已切换网页镜像站': '✓ Website mirror switched',
+    '✓ 已在新标签页打开镜像站首页': '✓ Mirror home opened in a new tab',
+    '该域名暂不支持网页镜像，已保留原链接': 'This domain cannot be domain-swapped; the original URL is kept',
+    '网页镜像站：': 'Website mirror: ',
+    '当前页面域名暂不支持网页镜像，请手动粘贴 github.com 链接': 'This page domain is not supported; paste a github.com URL manually',
+    '新标签页被浏览器拦截，链接已复制，请手动打开': 'The new tab was blocked; the link was copied, please open it manually',
+
+    /* GitHub 加速页精简版（2026-11） */
+    '⚡ 一键加速': '⚡ One-click accelerate',
+    '测速': 'Speed test',
+    '当前页': 'Current page',
+    '扫描本页': 'Scan page',
+    '下载类链接走文件代理，网页链接走镜像站；点一次自动分流，结果都在下方「加速结果」。': 'File links use download proxies, page links use website mirrors. One click splits them automatically.',
+    '设置与说明': 'Settings & help',
+    '下载加速': 'Download acceleration',
+    '复制最快': 'Copy fastest',
+    '下载最快': 'Download fastest',
+    '网页访问': 'Page visits',
+    '新标签页打开': 'Opens in a new tab',
+    '检测可用站点': 'Check mirrors',
+    '加速当前页': 'Accelerate this page',
+    '默认直连 github.com；只有检测到真正能返回 GitHub 页面的镜像站才会启用域名替换，不会跳到只支持 git / CLI 的站点。': 'By default we open github.com directly. Domain swapping turns on only after a mirror is verified to return a real GitHub page, so you never land on a git-only 403 site.',
+    '打开首选': 'Open first link',
+    '派生链接与 git clone 命令': 'Derived links & git clone commands',
+    '全局替换': 'Global rewrite',
+    '下载代理节点': 'Download proxy nodes',
+    '内置节点已于 2026-11 用真实文件复测，默认只启用返回 200 且内容正确的站点；测速会向节点发送一次 HEAD 请求。': 'Built-in nodes were retested with a real file in Nov 2026; only nodes returning correct content are on by default. A speed test sends one HEAD request per node.',
+    '网页镜像站（可自定义）': 'Website mirrors (customizable)',
+    '重新生成访问链接': 'Regenerate visit links',
+    'githubfast.com 实测只允许 git / CLI（浏览器返回 403），bgithub / kkgithub / gitclone 等已关停或反爬，所以默认不启用任何镜像站；检测通过或手动指定后才会替换域名。': 'githubfast.com only allows git / CLI (browsers get 403), and bgithub / kkgithub / gitclone are offline or bot-blocked. No mirror is on by default; a verified check or a manual choice is required.',
+    '页面图标与资源加速': 'Page icons & asset acceleration',
+    '在 GitHub 页面链接旁显示 ⚡ / ↓ / 🌐 图标': 'Show ⚡ / ↓ / 🌐 icons next to GitHub links',
+    '点击站内网页链接时自动加速打开（只拦截点击）': 'Open GitHub page links through the accelerator automatically (clicks only)',
+    '加速页面内 GitHub 图片 / Raw 资源': 'Accelerate GitHub images / raw assets on the page',
+    '图片 / Raw 属于文件，走上面的下载代理；网页链接走镜像站或直连，两者互不干扰。': 'Images and raw assets are files and use download proxies; page links use a mirror or a direct connection. The two paths are independent.',
+    '说明与隐私': 'Notes & privacy',
+    '粘贴链接点「一键加速」：下载类给出加速直链，网页类给出访问链接，均在新标签页打开。': 'Paste a URL and click "One-click accelerate": file links get mirror download URLs, page links get visit URLs. Both open in new tabs.',
+    '点「测速」才联网探测节点延迟，结果本机缓存 5 分钟；「检测可用站点」只访问内置镜像站首页做可用性判断。': 'Only "Speed test" probes node latency (cached locally for 5 minutes); "Check mirrors" just requests a known page from each built-in mirror.',
+    '不想复制粘贴，可在 GitHub 页面点链接旁的 ⚡ / ↓ / 🌐 图标，或右键使用 CTool 菜单。': 'To skip copy-paste, click the ⚡ / ↓ / 🌐 icons next to GitHub links or use the CTool right-click menu.',
+    '网页镜像站只能浏览公开页面，拿不到登录态；gist 等子域不支持域名替换，会保留原链接。': 'Website mirrors are read-only public views with no GitHub session; subdomains like gist keep their original URL.',
+    '加速节点与镜像站是第三方服务：使用加速链接或测速时对方能看到完整 GitHub 链接，私有仓库与带鉴权参数的链接请勿使用。其余转换全部在本机完成。': 'Nodes and mirrors are third-party services that can see the full GitHub URL when you use a link or run a test. Avoid private repos and URLs with tokens. Everything else stays local.',
+    '自定义前缀，如 https://mirror.example.com/': 'Custom prefix, e.g. https://mirror.example.com/',
+    '正在检测网页镜像站…': 'Checking website mirrors…',
+    '✓ 检测到 {count} 个可用镜像站': '✓ Found {count} usable mirror sites',
+    '未检测到可用网页镜像站，已改为直连 github.com': 'No usable website mirror found; falling back to a direct github.com connection',
+    '自动 · 有可用镜像站才启用，否则直连': 'Auto · use a verified mirror if available, otherwise connect directly',
+    '输入 GitHub 网页链接后点「一键加速」，这里会列出访问链接。': 'Enter a GitHub page URL and click "One-click accelerate"; visit links appear here.',
+    '当前无可用网页镜像站，直连 github.com': 'No usable website mirror; connecting to github.com directly',
+    '这是文件直链，建议用上方下载加速': 'This is a file URL — use download acceleration above',
+    '✓ 已直连打开（当前无可用网页镜像站）': '✓ Opened directly (no usable website mirror)',
+    '当前没有可用镜像站，请先检测或手动指定': 'No mirror selected; run a check or pick one manually',
+    '仅 git / CLI，浏览器访问 403': 'git / CLI only, browsers get 403',
+    '实测 403，可能已关停': '403 in testing, possibly offline',
+    '实测 404 / 无法连接': '404 / unreachable in testing',
+    '服务已暂停': 'Service paused',
+    '仅 clone，网页 502': 'clone only, web returns 502',
+    '广告跳转页，非镜像': 'Ad redirect, not a mirror',
+
+    /* 2026-11 第二轮：移除网页访问加速、站内链接统一新标签页 */
+    '粘贴 GitHub 文件 / 仓库链接，点一次即可生成加速直链；结果都在下方「加速结果」。': 'Paste GitHub file or repository URLs and click once to build accelerated links; results appear below.',
+    '在 GitHub 页面下载链接旁显示 ⚡ / ↓ 图标': 'Show ⚡ / ↓ icons next to download links on GitHub',
+    'GitHub 站内链接默认在新标签页打开（只拦截点击，不改写原链接）': 'Open GitHub internal links in a new tab (intercepts clicks only, links are untouched)',
+    '图片 / Raw 属于文件，走上面的下载代理；网页访问加速已下线，站内链接直接在新标签页打开，不会跳到第三方镜像站。': 'Images / raw assets are files and use the download proxy above. Page visit acceleration is gone: internal links open directly in a new tab, never through a third-party mirror.',
+    '粘贴 GitHub 链接点「一键加速」生成下载直链；结果里的「打开」按钮一律在新标签页打开。': 'Paste a GitHub URL and click "One-click accelerate" to build download links; every "Open" button uses a new tab.',
+    '点「测速」才联网探测节点延迟，结果本机缓存 5 分钟；其余转换全部在本机完成。': 'Only "Speed test" probes node latency (cached locally for 5 minutes); everything else runs on your device.',
+    '不想复制粘贴，可在 GitHub 页面点下载链接旁的 ⚡ / ↓ 图标，或右键使用 CTool 菜单。': 'To skip copy-paste, click the ⚡ / ↓ icons next to GitHub download links or use the CTool right-click menu.',
+    '网页镜像站实测普遍关停或只允许 git / CLI，因此已移除「加速访问此页面」；站内链接改为新标签页直连 github.com。': 'Website mirrors are mostly offline or git / CLI only, so "accelerate this page" was removed; internal links now open directly on github.com in a new tab.',
+    '加速节点是第三方服务：使用加速链接或测速时对方能看到完整 GitHub 链接，私有仓库与带鉴权参数的链接请勿使用。': 'Proxy nodes are third-party services that can see the full GitHub URL when you use a link or run a test. Avoid private repos and URLs with tokens.',
+    '✓ 已保存页面设置': '✓ Page settings saved',
+    '✓ 已在新标签页打开原链接': '✓ Original URL opened in a new tab',
   }, [
+    [/^✓ 已生成 (\\d+) 条访问链接$/, '✓ Generated $1 visit links'],
+    [/^✓ 已载入本页 (\\d+) 个网页链接$/, '✓ Loaded $1 page links'],
+    [/^✓ 已载入本页 (\\d+) 个链接$/, '✓ Loaded $1 links from this page'],
+    [/^展开全部 (\\d+) 个镜像$/, 'Show all $1 mirrors'],
+    [/^已生成 (\\d+) 条镜像直链$/, 'Generated $1 mirror links'],
+    [/^✓ 已生成 (\\d+) 条镜像直链$/, '✓ Generated $1 mirror links'],
+    [/^已跳过 (\\d+) 个非 GitHub 链接$/, 'Skipped $1 non-GitHub URLs'],
+    [/^正在测速 (\\d+) 个节点…$/, 'Testing $1 nodes…'],
+    [/^已测速 (\\d+) \\/ (\\d+) 个节点$/, 'Tested $1 / $2 nodes'],
+    [/^✓ 测速完成，(\\d+) \\/ (\\d+) 个节点可用$/, '✓ $1 / $2 nodes reachable'],
+    [/^已启用 (\\d+) \\/ (\\d+) 个节点$/, '$1 / $2 nodes enabled'],
+    [/^(\\d+) ms · 仅连通$/, '$1 ms · connectivity only'],
     [/^(\\d+) 处匹配(.*)$/, '$1 matches$2'],
     [/^显示 (\\d+) \\/ (\\d+) 项$/, 'Showing $1 / $2'],
     [/^已选 (\\d+) \\/ (\\d+) 项$/, '$1 / $2 selected'],
@@ -25864,16 +27390,77 @@ console.log('CTool');
   };
 
   /* ==========================================================================
-     AI 问答（唯一需要联网的工具）
+     AI 问答：默认内置 OpenCode Zen（零配置），也可切换自定义 OpenAI 兼容接口
      ========================================================================== */
 
   const AI_CONFIG_KEY = 'aiConfig';
-  const AI_DEFAULT_PROMPT = '你是一个严谨、简洁的助手。';
+  const ZEN_BASE_URL = 'https://opencode.ai/zen/v1';
+  const ZEN_MODELS_KEY = 'aiZenModels';
+  const ZEN_SESSION_KEY = 'aiZenSession';
+  /* 公共备用端点：Zen 匿名层被限流 / 客户端校验拦下时自动切换，同样无需 API Key */
+  const AI_FALLBACK_ENDPOINT = 'https://text.pollinations.ai/openai';
+  const AI_FALLBACK_MODEL = 'openai';
+  const AI_DEFAULT_PROMPT = '你是一个严谨、简洁、友好的助手。请优先使用中文回答，代码与专业术语可保留英文。';
   const AI_QUICK_PROMPTS = ['总结选中文本', '翻译成英文', '润色文本', '解释代码'];
+  /* /models 不可用时的内置回退池：只收录 -free 免费模型，按中文表现排序 */
+  const ZEN_FALLBACK_MODELS = [
+    { id: 'glm-5.3-flash-free', name: 'GLM 5.3 Flash' },
+    { id: 'deepseek-v4.1-flash-free', name: 'DeepSeek V4.1 Flash' },
+    { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning' },
+    { id: 'mimo-v2.6-flash-free', name: 'MiMo V2.6 Flash' },
+    { id: 'flint-40b-free', name: 'Flint 40B' },
+    { id: 'iceman-free', name: 'Iceman' },
+    { id: 'inkling-2-small-free', name: 'Inkling 2 Small' }
+  ];
+
+  function aiRandomId() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+      if (window.crypto && window.crypto.getRandomValues) {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (_) { /* 回退到伪随机 */ }
+    return String(Date.now()) + Math.random().toString(16).slice(2);
+  }
+
+  /* 匿名免费层要求稳定的会话标识；由油猴 / 扩展后台桥在请求时补上同名头 */
+  function zenSession() {
+    let value = getPref(ZEN_SESSION_KEY, '');
+    if (typeof value !== 'string' || !value) {
+      value = 'ses_ctool' + aiRandomId().replace(/-/g, '');
+      setPref(ZEN_SESSION_KEY, value);
+    }
+    return value;
+  }
 
   function getAiConfig() {
-    const value = getPref(AI_CONFIG_KEY, {});
-    return value && typeof value === 'object' ? value : {};
+    const raw = getPref(AI_CONFIG_KEY, {});
+    const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const baseUrl = typeof value.baseUrl === 'string' ? value.baseUrl : '';
+    let provider = value.provider === 'custom' || value.provider === 'zen' ? value.provider : '';
+    /* 兼容旧配置：填过非 Zen 地址的用户自动落到自定义接口，不丢原有设置 */
+    if (!provider) provider = baseUrl && baseUrl.indexOf('opencode.ai/zen') === -1 ? 'custom' : 'zen';
+    const apiKey = typeof value.apiKey === 'string' ? value.apiKey : '';
+    return {
+      provider: provider,
+      baseUrl: baseUrl,
+      model: typeof value.model === 'string' ? value.model : '',
+      apiKey: apiKey,
+      zenKey: typeof value.zenKey === 'string' ? value.zenKey : (provider === 'zen' ? apiKey : ''),
+      zenModel: typeof value.zenModel === 'string' ? value.zenModel : '',
+      systemPrompt: typeof value.systemPrompt === 'string' ? value.systemPrompt : '',
+      temperature: typeof value.temperature === 'number' ? value.temperature : 0.7,
+      stream: value.stream !== false,
+      autoFallback: value.autoFallback !== false
+    };
+  }
+
+  function saveAiConfig(partial) {
+    const merged = Object.assign(getAiConfig(), partial || {});
+    setPref(AI_CONFIG_KEY, merged);
+    return merged;
   }
 
   function normalizeEndpoint(baseUrl) {
@@ -25884,9 +27471,134 @@ console.log('CTool');
     return value + '/v1/chat/completions';
   }
 
-  T.renderers.ai = function renderAi(root) {
+  function zenModelList() {
+    const cached = getPref(ZEN_MODELS_KEY, null);
+    if (Array.isArray(cached) && cached.length) {
+      const valid = cached
+        .filter((item) => item && typeof item.id === 'string' && /-free/i.test(item.id))
+        .map((item) => ({ id: item.id, name: String(item.name || item.id) }));
+      if (valid.length) return valid;
+    }
+    return ZEN_FALLBACK_MODELS.slice();
+  }
+
+  function zenModelRank(id) {
+    const index = ZEN_FALLBACK_MODELS.findIndex((item) => item.id === id);
+    return index === -1 ? 90 : index;
+  }
+
+  function modelQueue(preferred) {
+    const queue = [];
+    if (preferred) queue.push(preferred);
+    zenModelList().forEach((item) => {
+      if (queue.indexOf(item.id) === -1) queue.push(item.id);
+    });
+    return queue.slice(0, 6);
+  }
+
+  function makeResponse(data) {
+    const text = typeof data.text === 'string' ? data.text : '';
+    return {
+      ok: data.ok === true,
+      status: Number(data.status) || 0,
+      statusText: String(data.statusText || ''),
+      body: null,
+      text: function () { return Promise.resolve(text); },
+      json: function () { return Promise.resolve(JSON.parse(text || '{}')); }
+    };
+  }
+
+  /* 油猴版由宿主用 GM_xmlhttpRequest 发请求，绕开 iframe 的 CORS */
+  function aiRequest(url, options) {
+    if (typeof T.aiFetch === 'function') return T.aiFetch(url, options);
+    return fetch(url, options);
+  }
+
+  /* 扩展后台兜底：页面 fetch 若被 CORS / CSP 拦下，改由 service worker 发请求 */
+  function extensionRequest(url, headers, body) {
+    const payload = { type: 'ctool-ai-fetch', url: url, headers: headers, body: body };
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (data) => {
+        if (settled) return;
+        settled = true;
+        if (!data || typeof data.ok !== 'boolean') reject(new Error('后台未返回响应'));
+        else resolve(makeResponse(data));
+      };
+      try {
+        const result = chrome.runtime.sendMessage(payload, finish);
+        if (result && typeof result.then === 'function') {
+          result.then(finish).catch((error) => {
+            if (!settled) { settled = true; reject(error); }
+          });
+        }
+      } catch (error) {
+        if (!settled) { settled = true; reject(error); }
+      }
+    });
+  }
+
+  function hasExtensionBridge() {
+    return typeof T.aiFetch !== 'function' &&
+      typeof chrome !== 'undefined' && chrome.runtime &&
+      typeof chrome.runtime.sendMessage === 'function' &&
+      typeof chrome.runtime.id === 'string' && chrome.runtime.id !== 'ctool-userjs';
+  }
+
+  function parseAiError(raw, status, statusText) {
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) { data = null; }
+    const error = data && data.error ? data.error : null;
+    const detail = error ? (error.message || error.code || error.type) : (raw || statusText || 'HTTP ' + status);
+    return String(detail || 'HTTP ' + status).slice(0, 300);
+  }
+
+  function isRetryable(status, detail) {
+    return status === 0 || status === 401 || status === 403 || status === 404 ||
+      status === 408 || status === 429 || status >= 500 ||
+      /FreeUsageLimit|RegionError|RateLimit|MissingSession|quota|rate limit|overloaded|temporarily/i.test(detail || '');
+  }
+
+  function aiFriendlyError(detail, isZen, hasKey, fallbackTried) {
+    const head = T.t('请求失败：') + detail;
+    if (!isZen || hasKey) return head;
+    let text = head + '\\n\\n' + T.t('OpenCode Zen 免费模型当前不可用。可稍后重试，或在高级设置中填入自己的 Zen API Key，也可以切换到自定义接口。');
+    if (fallbackTried) text += '\\n' + T.t('公共备用端点也未能响应，请稍后重试。');
+    return text;
+  }
+
+  async function refreshZenModels() {
+    const response = await aiRequest(ZEN_BASE_URL + '/models', { method: 'GET' });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const text = await response.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) { data = null; }
+    const list = (data && Array.isArray(data.data) ? data.data : [])
+      .filter((item) => item && typeof item.id === 'string' && /-free/i.test(item.id))
+      .map((item) => ({ id: item.id, name: String(item.name || item.id) }))
+      .sort((a, b) => zenModelRank(a.id) - zenModelRank(b.id));
+    if (!list.length) throw new Error(T.t('暂无可用的免费模型'));
+    setPref(ZEN_MODELS_KEY, list);
+    return list;
+  }
+
+  T.aiZen = {
+    baseUrl: ZEN_BASE_URL,
+    fallbackModels: ZEN_FALLBACK_MODELS,
+    normalizeEndpoint: normalizeEndpoint,
+    zenModelList: zenModelList,
+    modelQueue: modelQueue,
+    parseAiError: parseAiError,
+    isRetryable: isRetryable,
+    refreshZenModels: refreshZenModels,
+    session: zenSession,
+    getConfig: getAiConfig
+  };
+
+  T.renderers.ai = function renderAi(root, context) {
     const config = getAiConfig();
     const messages = [];
+    const bridgeMode = typeof T.aiFetch === 'function';
 
     root.innerHTML = \`
       <div class="ai-layout">
@@ -25896,39 +27608,78 @@ console.log('CTool');
             <div class="card-actions"><span class="badge badge-warn">联网</span></div>
           </div>
           <div class="card-body">
-            <label class="field">
-              <span class="field-label">接口地址</span>
-              <input class="input" id="ai-base" type="url" spellcheck="false" placeholder="https://api.openai.com/v1" value="\${escapeHtml(config.baseUrl || '')}">
-              <span class="field-hint">支持 OpenAI 兼容接口，例如 https://api.openai.com/v1 或本地服务。</span>
-            </label>
-            <div class="form-grid">
+            <div class="ai-provider-switch" id="ai-provider">
+              <button class="ai-provider-btn" type="button" data-provider="zen">
+                <strong>OpenCode Zen</strong><small>零配置 · 免费模型</small>
+              </button>
+              <button class="ai-provider-btn" type="button" data-provider="custom">
+                <strong>自定义接口</strong><small>OpenAI 兼容 / 本地模型</small>
+              </button>
+            </div>
+
+            <div class="ai-zen-panel" id="ai-zen-panel">
+              <div class="ai-zen-note">已内置 OpenCode Zen 免费模型，打开即可提问，无需接口地址或 API Key。免费模型池会轮换，请求失败时自动切换其他模型。</div>
               <label class="field">
-                <span class="field-label">模型</span>
-                <input class="input" id="ai-model" type="text" spellcheck="false" placeholder="gpt-4o-mini" value="\${escapeHtml(config.model || '')}">
-              </label>
-              <label class="field">
-                <span class="field-label">API Key</span>
-                <input class="input" id="ai-key" type="password" autocomplete="off" placeholder="sk-…" value="\${escapeHtml(config.apiKey || '')}">
+                <span class="field-label">免费模型</span>
+                <div class="ai-zen-row">
+                  <select class="select" id="ai-zen-model" aria-label="免费模型"></select>
+                  <button class="btn btn-sm" type="button" id="ai-zen-refresh">刷新模型</button>
+                </div>
+                <span class="field-hint">列表来自 Zen 的 /models 接口，点「刷新模型」获取最新免费池。</span>
               </label>
             </div>
-            <label class="field">
-              <span class="field-label">系统提示词</span>
-              <textarea class="textarea" id="ai-system" placeholder="你是一个严谨、简洁的助手。">\${escapeHtml(config.systemPrompt || '')}</textarea>
-            </label>
-            <div class="form-grid">
+
+            <div class="ai-custom-panel" id="ai-custom-panel" hidden>
               <label class="field">
-                <span class="field-label">温度</span>
-                <input class="input" id="ai-temperature" type="number" min="0" max="2" step="0.1" value="\${escapeHtml(String(config.temperature == null ? 0.7 : config.temperature))}">
+                <span class="field-label">接口地址</span>
+                <input class="input" id="ai-base" type="url" spellcheck="false" placeholder="https://api.openai.com/v1" value="\${escapeHtml(config.baseUrl)}">
+                <span class="field-hint">支持 OpenAI 兼容接口，例如 https://api.openai.com/v1 或本地 Ollama 服务。</span>
               </label>
-              <label class="option with-desc">
-                <input type="checkbox" id="ai-stream"\${config.stream === false ? '' : ' checked'}>
-                <span>流式输出<small>逐字显示回答，适合长文本</small></span>
-              </label>
+              <div class="form-grid">
+                <label class="field">
+                  <span class="field-label">模型</span>
+                  <input class="input" id="ai-model" type="text" spellcheck="false" placeholder="gpt-4o-mini" value="\${escapeHtml(config.model)}">
+                </label>
+                <label class="field">
+                  <span class="field-label">API Key</span>
+                  <input class="input" id="ai-key" type="password" autocomplete="off" placeholder="sk-…" value="\${escapeHtml(config.apiKey)}">
+                </label>
+              </div>
             </div>
-            <div class="ai-key-note">API Key 仅保存在本机 localStorage，不会同步或上传到其他服务；本地服务（如 Ollama）可留空。</div>
+
+            <details class="ai-advanced" id="ai-advanced">
+              <summary>高级设置</summary>
+              <div class="ai-advanced-body">
+                <label class="field">
+                  <span class="field-label">Zen API Key（可选）</span>
+                  <input class="input" id="ai-zen-key" type="password" autocomplete="off" placeholder="留空即匿名免费使用" value="\${escapeHtml(config.zenKey)}">
+                  <span class="field-hint">匿名免费额度不可用时，可填入自己的 OpenCode Zen Key 提升稳定性。</span>
+                </label>
+                <label class="field">
+                  <span class="field-label">系统提示词</span>
+                  <textarea class="textarea" id="ai-system" placeholder="你是一个严谨、简洁的助手。">\${escapeHtml(config.systemPrompt)}</textarea>
+                </label>
+                <div class="form-grid">
+                  <label class="field">
+                    <span class="field-label">温度</span>
+                    <input class="input" id="ai-temperature" type="number" min="0" max="2" step="0.1" value="\${escapeHtml(String(config.temperature))}">
+                  </label>
+                  <label class="option with-desc">
+                    <input type="checkbox" id="ai-stream"\${config.stream === false ? '' : ' checked'}>
+                    <span>流式输出<small>\${escapeHtml(bridgeMode ? '油猴脚本版使用完整响应' : '逐字显示回答，适合长文本')}</small></span>
+                  </label>
+                </div>
+                <label class="option with-desc">
+                  <input type="checkbox" id="ai-auto-fallback"\${config.autoFallback === false ? '' : ' checked'}>
+                  <span>Zen 不可用时自动使用公共备用端点<small>内置 Pollinations 公共端点，同样无需 API Key；提示词会发送给第三方服务。</small></span>
+                </label>
+              </div>
+            </details>
+
+            <div class="ai-key-note">设置会自动保存在本机 localStorage，无需点击保存；API Key 不会同步或上传到其他服务。</div>
             <div class="row-between">
-              <button class="btn btn-primary" type="button" id="ai-save">保存设置</button>
               <span class="status" id="ai-settings-status"></span>
+              <span class="field-hint">修改后立即生效</span>
             </div>
           </div>
         </section>
@@ -25937,15 +27688,15 @@ console.log('CTool');
           <div class="card-head">
             <div class="card-heading"><span class="card-icon">CHAT</span><h2>AI 问答</h2></div>
             <div class="card-actions">
-              <span class="badge" id="ai-state">未配置</span>
+              <span class="badge" id="ai-state">零配置 · 就绪</span>
               <button class="btn btn-sm" type="button" id="ai-clear">清除对话</button>
             </div>
           </div>
           <div class="card-body">
             <div class="ai-chat-log" id="ai-log">
               <div class="ai-empty" id="ai-empty">
-                <strong>\${T.t('使用 OpenAI 兼容接口进行问答')}</strong>
-                <span>\${T.t('先在左侧保存接口地址、模型和 API Key，然后在下方提问。')}</span>
+                <strong>\${T.t('直接输入问题，无需任何配置')}</strong>
+                <span>\${T.t('默认使用 OpenCode Zen 免费模型；也可以切换到自己的接口。')}</span>
               </div>
             </div>
             <div class="ai-composer">
@@ -25958,7 +27709,7 @@ console.log('CTool');
               </div>
             </div>
             <div class="ai-disclosure">
-              AI 问答会把你的问题和 API Key 发送到你配置的服务，其他工具仍然完全离线。
+              AI 问答会把你的问题发送到 OpenCode Zen（或你配置的服务）；Zen 不可用时会自动回退到 Pollinations 公共端点，均可在高级设置中关闭。免费模型的提示词可能用于改进模型，请勿提交个人或机密信息；其余工具仍然完全离线。
             </div>
             <div class="status" id="ai-status"></div>
           </div>
@@ -25966,12 +27717,19 @@ console.log('CTool');
       </div>
     \`;
 
+    const providerBox = $('#ai-provider', root);
+    const zenPanel = $('#ai-zen-panel', root);
+    const customPanel = $('#ai-custom-panel', root);
+    const zenModelSelect = $('#ai-zen-model', root);
+    const zenRefreshButton = $('#ai-zen-refresh', root);
+    const zenKeyInput = $('#ai-zen-key', root);
     const baseInput = $('#ai-base', root);
     const modelInput = $('#ai-model', root);
     const keyInput = $('#ai-key', root);
     const systemInput = $('#ai-system', root);
     const temperatureInput = $('#ai-temperature', root);
     const streamInput = $('#ai-stream', root);
+    const autoFallbackInput = $('#ai-auto-fallback', root);
     const settingsStatus = $('#ai-settings-status', root);
     const log = $('#ai-log', root);
     const empty = $('#ai-empty', root);
@@ -25980,23 +27738,53 @@ console.log('CTool');
     const stateBadge = $('#ai-state', root);
     const status = $('#ai-status', root);
     let sending = false;
+    let provider = config.provider;
 
     function currentConfig() {
       return {
+        provider: provider,
         baseUrl: baseInput.value.trim(),
         model: modelInput.value.trim(),
         apiKey: keyInput.value.trim(),
+        zenKey: zenKeyInput.value.trim(),
+        zenModel: zenModelSelect.value,
         systemPrompt: systemInput.value.trim(),
         temperature: Math.max(0, Math.min(2, Number(temperatureInput.value) || 0)),
-        stream: !streamInput || streamInput.checked
+        stream: streamInput ? streamInput.checked : true,
+        autoFallback: autoFallbackInput ? autoFallbackInput.checked : true
       };
     }
 
+    function fillModelOptions() {
+      const list = zenModelList();
+      const previous = zenModelSelect.value;
+      zenModelSelect.innerHTML = list.map((item) =>
+        '<option value="' + escapeHtml(item.id) + '">' + escapeHtml(item.id + ' · ' + item.name) + '</option>'
+      ).join('');
+      if (previous && list.some((item) => item.id === previous)) zenModelSelect.value = previous;
+      else if (config.zenModel && list.some((item) => item.id === config.zenModel)) zenModelSelect.value = config.zenModel;
+    }
+
+    function persist(partial) {
+      saveAiConfig(partial);
+      refreshState();
+    }
+
     function refreshState() {
-      const value = currentConfig();
-      const ready = !!(value.baseUrl && value.model);
-      stateBadge.textContent = ready ? '已配置' : '未配置';
-      stateBadge.className = 'badge ' + (ready ? 'badge-ok' : 'badge-warn');
+      const cfg = currentConfig();
+      $$('.ai-provider-btn', providerBox).forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-provider') === provider);
+      });
+      zenPanel.hidden = provider !== 'zen';
+      customPanel.hidden = provider !== 'custom';
+      if (provider === 'zen') {
+        stateBadge.textContent = cfg.zenKey ? T.t('Zen Key · 就绪') : T.t('零配置 · 就绪');
+        stateBadge.className = 'badge badge-ok';
+      } else {
+        const ready = !!(cfg.baseUrl && cfg.model);
+        stateBadge.textContent = ready ? T.t('已配置') : T.t('未配置');
+        stateBadge.className = 'badge ' + (ready ? 'badge-ok' : 'badge-warn');
+      }
     }
 
     function scrollToBottom() {
@@ -26007,188 +27795,263 @@ console.log('CTool');
       if (empty) empty.hidden = true;
       const wrapper = document.createElement('div');
       wrapper.className = 'ai-message ai-' + role + (pending ? ' ai-pending' : '');
-      const label = role === 'user' ? '你' : '助手';
+      const label = role === 'user' ? T.t('你') : T.t('助手');
       wrapper.innerHTML = '<div class="ai-message-meta"><span>' + escapeHtml(label) + '</span>' +
-        (role === 'assistant' && !pending ? '<button class="copy-mini" type="button" data-ai-copy>复制回答</button>' : '') +
+        (role === 'assistant' && !pending ? '<button class="copy-mini" type="button" data-ai-copy>' + escapeHtml(T.t('复制回答')) + '</button>' : '') +
         '</div><div class="ai-message-body">' + escapeHtml(text) + '</div>';
       log.appendChild(wrapper);
       scrollToBottom();
       return wrapper;
     }
 
-    function updateBadges() {
-      refreshState();
+    function attachCopy(pending) {
+      pending.classList.remove('ai-pending');
+      const meta = pending.querySelector('.ai-message-meta');
+      if (meta && !meta.querySelector('[data-ai-copy]')) {
+        const button = document.createElement('button');
+        button.className = 'copy-mini';
+        button.type = 'button';
+        button.setAttribute('data-ai-copy', '');
+        button.textContent = T.t('复制回答');
+        meta.appendChild(button);
+      }
     }
 
-    function appendError(message) {
-      addMessage('assistant', message, false);
-      setStatus(status, message, 'error');
+    /* 单次请求：返回 { content, retryable, error }；流式内容实时写入 pending */
+    async function askOnce(options) {
+      const payload = {
+        model: options.model,
+        messages: options.payloadMessages,
+        temperature: options.temperature,
+        stream: options.useStream
+      };
+      const body = JSON.stringify(payload);
+      let response;
+      try {
+        response = await aiRequest(options.endpoint, {
+          method: 'POST',
+          headers: options.headers,
+          body: body,
+          signal: options.controller ? options.controller.signal : undefined
+        });
+      } catch (error) {
+        if (!hasExtensionBridge() || (error && error.name === 'AbortError')) throw error;
+        /* 页面直连被 CORS / CSP 拦截时，改走扩展后台桥（非流式） */
+        response = await extensionRequest(options.endpoint, options.headers, JSON.stringify(Object.assign({}, payload, { stream: false })));
+      }
+
+      if (!response.ok) {
+        const raw = await response.text();
+        const detail = parseAiError(raw, response.status, response.statusText);
+        return {
+          content: '',
+          retryable: isRetryable(response.status, detail),
+          error: new Error(detail)
+        };
+      }
+
+      const canStream = options.useStream && response.body && typeof response.body.getReader === 'function';
+      let content = '';
+
+      function renderDelta() {
+        options.pendingBody.textContent = content;
+        options.pending.classList.remove('ai-pending');
+        scrollToBottom();
+      }
+
+      if (canStream) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        let finished = false;
+        const handleLine = (line) => {
+          const trimmed = line.replace(/\\r$/, '');
+          if (!trimmed || trimmed.charAt(0) === ':' || trimmed.indexOf('data:') !== 0) return;
+          const chunk = trimmed.slice(5).trim();
+          if (!chunk) return;
+          if (chunk === '[DONE]') { finished = true; return; }
+          let json = null;
+          try { json = JSON.parse(chunk); } catch (_) { return; }
+          const choice = json.choices && json.choices[0];
+          if (!choice) return;
+          const delta = choice.delta || choice.message || {};
+          const piece = delta.content != null ? delta.content : '';
+          if (piece) { content += piece; renderDelta(); }
+        };
+        while (!finished) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          let index;
+          while (!finished && (index = buffer.indexOf('\\n')) !== -1) {
+            const line = buffer.slice(0, index);
+            buffer = buffer.slice(index + 1);
+            handleLine(line);
+          }
+        }
+        if (!finished && buffer.trim()) handleLine(buffer);
+      } else {
+        const raw = await response.text();
+        let data = null;
+        try { data = raw ? JSON.parse(raw) : null; } catch (_) { data = null; }
+        content = data && data.choices && data.choices[0] && data.choices[0].message
+          ? data.choices[0].message.content
+          : '';
+        /* 兼容只返回 SSE 文本但没有 response.body 的环境 */
+        if (!content && raw && raw.indexOf('data:') !== -1) {
+          const pieces = [];
+          raw.split('\\n').forEach((line) => {
+            const trimmed = line.trim();
+            if (trimmed.indexOf('data:') !== 0) return;
+            const chunk = trimmed.slice(5).trim();
+            if (!chunk || chunk === '[DONE]') return;
+            try {
+              const json = JSON.parse(chunk);
+              const delta = json.choices && json.choices[0] && (json.choices[0].delta || json.choices[0].message);
+              if (delta && typeof delta.content === 'string') pieces.push(delta.content);
+            } catch (_) {}
+          });
+          content = pieces.join('');
+        }
+      }
+
+      if (!content) {
+        return { content: '', retryable: true, error: new Error(T.t('返回内容为空')) };
+      }
+      return { content: content, retryable: false, error: null };
     }
 
     async function send() {
       if (sending) return;
       const text = input.value.trim();
       if (!text) {
-        setStatus(status, '请先输入问题', 'warn');
+        setStatus(status, T.t('请先输入问题'), 'warn');
         input.focus();
         return;
       }
-      const configValue = currentConfig();
-      if (!configValue.baseUrl || !configValue.model) {
-        setStatus(status, '尚未配置 AI 接口，请先在设置中填写接口地址和模型。', 'warn');
-        appendError('尚未配置 AI 接口。请先在左侧填写接口地址和模型。');
+      const cfg = currentConfig();
+      const isZen = cfg.provider === 'zen';
+      const endpoint = isZen ? ZEN_BASE_URL + '/chat/completions' : normalizeEndpoint(cfg.baseUrl);
+      if (!isZen && (!cfg.baseUrl || !cfg.model)) {
+        setStatus(status, T.t('尚未配置 AI 接口，请先填写接口地址和模型。'), 'warn');
+        addMessage('assistant', T.t('尚未配置 AI 接口。请先在左侧填写接口地址和模型，或切回 OpenCode Zen 免配置使用。'), false);
         return;
       }
 
-      const endpoint = normalizeEndpoint(configValue.baseUrl);
-      const useStream = configValue.stream !== false;
+      /* 油猴版走 GM_xmlhttpRequest 桥，只能拿到完整响应，因此不启用流式 */
+      const useStream = cfg.stream !== false && !bridgeMode;
+      const headers = { 'Content-Type': 'application/json' };
+      const key = isZen ? cfg.zenKey : cfg.apiKey;
+      if (key) headers.Authorization = 'Bearer ' + key;
+      /* 匿名免费层：不发送 Authorization，避免被当作无效 Key 拒绝；会话头由桥补充 */
+
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 90000) : null;
       sending = true;
       sendButton.disabled = true;
       input.value = '';
       addMessage('user', text, false);
-      const pending = addMessage('assistant', '正在思考…', true);
+      const pending = addMessage('assistant', T.t('正在思考…'), true);
       const pendingBody = pending.querySelector('.ai-message-body');
       messages.push({ role: 'user', content: text });
-      setStatus(status, useStream ? '正在接收流式回答…' : '正在请求…', 'info');
 
+      const system = cfg.systemPrompt || AI_DEFAULT_PROMPT;
       const payloadMessages = [];
-      const system = configValue.systemPrompt || AI_DEFAULT_PROMPT;
       if (system) payloadMessages.push({ role: 'system', content: system });
       messages.forEach((message) => payloadMessages.push(message));
+      setStatus(status, useStream ? T.t('正在接收流式回答…') : T.t('正在请求…'), 'info');
 
-      const controller = typeof AbortController === 'function' ? new AbortController() : null;
-      const timer = controller ? setTimeout(() => controller.abort(), 90000) : null;
-      let content = '';
-
-      function attachCopy() {
-        pending.classList.remove('ai-pending');
-        const meta = pending.querySelector('.ai-message-meta');
-        if (meta && !meta.querySelector('[data-ai-copy]')) {
-          const button = document.createElement('button');
-          button.className = 'copy-mini';
-          button.type = 'button';
-          button.setAttribute('data-ai-copy', '');
-          button.textContent = '复制回答';
-          meta.appendChild(button);
-        }
-      }
-
-      function renderDelta() {
-        pendingBody.textContent = content;
-        pending.classList.remove('ai-pending');
-        scrollToBottom();
-      }
+      const zenIds = isZen ? modelQueue(cfg.zenModel).slice(0, 3) : [];
+      let candidates = isZen
+        ? zenIds.map((id) => ({ model: id, endpoint: endpoint, fallback: false }))
+        : [{ model: cfg.model, endpoint: endpoint, fallback: false }];
+      const useFallback = isZen && cfg.autoFallback !== false && !key;
+      let fallbackAdded = false;
+      let lastError = null;
+      let refreshed = false;
+      let done = false;
 
       try {
-        const headers = { 'Content-Type': 'application/json' };
-        if (configValue.apiKey) headers.Authorization = 'Bearer ' + configValue.apiKey;
-
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: headers,
-          body: JSON.stringify({
-            model: configValue.model,
-            messages: payloadMessages,
-            temperature: configValue.temperature,
-            stream: useStream
-          }),
-          signal: controller ? controller.signal : undefined
-        });
-
-        if (!response.ok) {
-          const raw = await response.text();
-          let data = null;
-          try {
-            data = raw ? JSON.parse(raw) : null;
-          } catch (_) {
-            data = null;
+        for (let i = 0; i < candidates.length && !done; i++) {
+          const candidate = candidates[i];
+          const model = candidate.model;
+          if (i > 0) {
+            const label = candidate.fallback
+              ? T.t('正在切换公共备用端点…')
+              : T.t('正在切换模型：') + model;
+            pendingBody.textContent = label;
+            setStatus(status, label, 'info');
           }
-          const detail = data && data.error && (data.error.message || data.error.code)
-            ? data.error.message || data.error.code
-            : (raw || response.statusText || 'HTTP ' + response.status);
-          throw new Error(String(detail).slice(0, 500));
-        }
+          let result;
+          try {
+            result = await askOnce({
+              endpoint: candidate.endpoint,
+              headers: headers,
+              model: model,
+              payloadMessages: payloadMessages,
+              temperature: cfg.temperature,
+              useStream: useStream,
+              controller: controller,
+              pending: pending,
+              pendingBody: pendingBody
+            });
+          } catch (error) {
+            result = {
+              content: '',
+              retryable: !(error && error.name === 'AbortError'),
+              error: error
+            };
+          }
 
-        const canStream = useStream && response.body && typeof response.body.getReader === 'function';
-        if (canStream) {
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder('utf-8');
-          let buffer = '';
-          let finished = false;
+          if (result.content) {
+            pendingBody.textContent = result.content;
+            attachCopy(pending);
+            messages.push({ role: 'assistant', content: result.content });
+            setStatus(status, T.t('✓ 回答完成') + ' · ' + model +
+              (candidate.fallback ? T.t('（公共备用端点）') : ''), 'ok');
+            scrollToBottom();
+            done = true;
+            break;
+          }
 
-          const handleLine = (line) => {
-            const trimmed = line.replace(/\\r$/, '');
-            if (!trimmed || trimmed.charAt(0) === ':') return;
-            if (trimmed.indexOf('data:') !== 0) return;
-            const payload = trimmed.slice(5).trim();
-            if (!payload) return;
-            if (payload === '[DONE]') {
-              finished = true;
-              return;
-            }
-            let json = null;
+          lastError = result.error || new Error(T.t('请求失败'));
+          if (!isZen || !result.retryable) break;
+
+          /* Zen 连续失败时切换到免 Key 的公共备用端点，保证零配置仍可问答 */
+          if (useFallback && !fallbackAdded && !candidate.fallback &&
+              i >= Math.min(1, candidates.length - 1)) {
+            fallbackAdded = true;
+            candidates = candidates.slice(0, i + 1).concat([
+              { model: AI_FALLBACK_MODEL, endpoint: AI_FALLBACK_ENDPOINT, fallback: true }
+            ]);
+            continue;
+          }
+
+          /* 关闭自动回退时：内置队列耗尽就联网刷新一次免费模型池再试几个新模型 */
+          if (!useFallback && i === candidates.length - 1 && !refreshed) {
+            refreshed = true;
             try {
-              json = JSON.parse(payload);
-            } catch (_) {
-              return;
-            }
-            const choice = json.choices && json.choices[0];
-            if (!choice) return;
-            const delta = choice.delta || choice.message || {};
-            const piece = delta.content != null ? delta.content : '';
-            if (piece) {
-              content += piece;
-              renderDelta();
-            }
-          };
-
-          while (!finished) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            buffer += decoder.decode(chunk.value, { stream: true });
-            let index;
-            while (!finished && (index = buffer.indexOf('\\n')) !== -1) {
-              const line = buffer.slice(0, index);
-              buffer = buffer.slice(index + 1);
-              handleLine(line);
-            }
+              const fresh = await refreshZenModels();
+              fillModelOptions();
+              const extra = fresh
+                .map((item) => item.id)
+                .filter((id) => zenIds.indexOf(id) === -1)
+                .slice(0, 3)
+                .map((id) => ({ model: id, endpoint: endpoint, fallback: false }));
+              candidates = candidates.concat(extra);
+            } catch (_) { /* 刷新失败就按现有错误提示 */ }
           }
-          if (!finished && buffer.trim()) handleLine(buffer);
-        } else {
-          const raw = await response.text();
-          let data = null;
-          try {
-            data = raw ? JSON.parse(raw) : null;
-          } catch (_) {
-            data = null;
-          }
-          content = data && data.choices && data.choices[0] && data.choices[0].message
-            ? data.choices[0].message.content
-            : '';
         }
 
-        if (!content) throw new Error('返回内容为空');
-
-        pendingBody.textContent = content;
-        attachCopy();
-        messages.push({ role: 'assistant', content: content });
-        setStatus(status, '✓ 回答完成', 'ok');
-        scrollToBottom();
-      } catch (error) {
-        if (content) {
-          pendingBody.textContent = content + '\\n\\n[回答中断]';
-          attachCopy();
-          messages.push({ role: 'assistant', content: content });
-          setStatus(status, '回答中断：' + (error && error.message ? error.message : '未知错误'), 'warn');
-          scrollToBottom();
-        } else {
+        if (!done) {
           pending.remove();
           messages.pop();
-          if (error && error.name === 'AbortError') {
-            appendError('请求超时');
-          } else {
-            appendError('请求失败：' + (error.message || '未知错误'));
-          }
+          const detail = lastError && lastError.name === 'AbortError'
+            ? T.t('请求超时')
+            : (lastError && lastError.message ? lastError.message : T.t('请求失败'));
+          const message = aiFriendlyError(detail, isZen, !!key, fallbackAdded);
+          addMessage('assistant', message, false);
+          setStatus(status, message, 'error');
         }
       } finally {
         if (timer) clearTimeout(timer);
@@ -26206,13 +28069,38 @@ console.log('CTool');
       if (body) copyText(body.textContent);
     });
 
-    $('#ai-save', root).addEventListener('click', () => {
-      const value = currentConfig();
-      setPref(AI_CONFIG_KEY, value);
-      setStatus(settingsStatus, '✓ 已保存', 'ok');
-      refreshState();
-      showToast('已保存');
+    providerBox.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-provider]');
+      if (!button) return;
+      provider = button.getAttribute('data-provider') === 'custom' ? 'custom' : 'zen';
+      persist({ provider: provider });
+      setStatus(settingsStatus, '', '');
     });
+
+    zenRefreshButton.addEventListener('click', async () => {
+      zenRefreshButton.disabled = true;
+      setStatus(settingsStatus, T.t('正在获取模型列表…'), 'info');
+      try {
+        const list = await refreshZenModels();
+        fillModelOptions();
+        setStatus(settingsStatus, T.t('✓ 已更新 {count} 个免费模型', { count: list.length }), 'ok');
+      } catch (error) {
+        setStatus(settingsStatus, T.t('获取失败：') + (error && error.message ? error.message : T.t('未知错误')), 'warn');
+      } finally {
+        zenRefreshButton.disabled = false;
+      }
+    });
+
+    zenModelSelect.addEventListener('change', () => {
+      persist({ zenModel: zenModelSelect.value });
+    });
+
+    [baseInput, modelInput, keyInput, zenKeyInput, systemInput, temperatureInput, streamInput, autoFallbackInput].forEach((element) => {
+      if (!element) return;
+      const handler = () => persist(currentConfig());
+      element.addEventListener(element.type === 'checkbox' || element.tagName === 'SELECT' ? 'change' : 'input', handler);
+    });
+
     $('#ai-clear', root).addEventListener('click', () => {
       messages.length = 0;
       log.innerHTML = '';
@@ -26228,10 +28116,17 @@ console.log('CTool');
     });
     sendButton.addEventListener('click', send);
     bindCtrlEnter(input, send);
-    [baseInput, modelInput, keyInput, streamInput].forEach((element) => {
-      if (element) element.addEventListener('input', refreshState);
-    });
+    fillModelOptions();
+    if (provider === 'zen' && config.zenModel) zenModelSelect.value = config.zenModel;
     refreshState();
+
+    /* 右键「问 AI」：文本已经随任务传入，直接提问，不需要复制粘贴 */
+    if (context && context.text && context.action === 'ask') {
+      input.value = context.text;
+      setTimeout(() => {
+        if (root.contains(input)) send();
+      }, 80);
+    }
   };
 })();
 
@@ -29050,6 +30945,1519 @@ console.log('CTool');
   };
 })();
 
+/* ===== js/tools-github.js ===== */
+;
+/* CTool - GitHub 下载加速
+ *
+ * 继承参考油猴脚本「GitHub 加速 & 增强助手 v1.5.6」的核心思路：
+ *   - 镜像池：内置公益节点 + 自定义节点，统一管理启用状态
+ *   - mirrorUrl：镜像前缀 + 完整 GitHub URL；以 ? = & 结尾的前缀免斜杠直拼
+ *   - HEAD 预检测速：只判断连通性与延迟，5 分钟 fresh 缓存；405/501 不计失败
+ *   - 直链交付：原生 a[download].click()，不中转字节，便于外部下载器接管
+ *
+ * 只保留文件下载加速：文件代理节点（gh-proxy.com 等）只转发 Release / Raw /
+ * 源码包等文件字节。2026-11 实测第三方「同构镜像站」对浏览器返回 403
+ * （To prevent abuse, only git and CLI access are allowed）或已关停，
+ * 因此网页访问加速（🌐 图标 / 加速访问此页面 / 自动镜像代理 / 镜像站检测）
+ * 已全部下线，GitHub 站内链接改为统一在新标签页打开。
+ *
+ * 页面联动（js/page-github.js 负责识别与注入图标）：
+ *   - GitHub 页面下载链接旁的 ⚡ / ↓ 图标把链接作为 task.text 传进本工具
+ *   - task.action = download / quick-download 时生成后自动交付首选直链
+ *   - 「扫描本页链接」通过后台向来源标签页取回本页识别到的全部链接
+ *   - 站内网页链接的点击由注入器交给宿主新开标签页，不经过本工具
+ *
+ * 与参考脚本的差异（适配工具箱形态）：
+ *   - 页面注入默认只在 GitHub 域名启用，可随时在工具页关闭，且不改写原链接
+ *   - 不自动下载、不在页面打开时发起任何请求
+ *   - 只有点击「测速」或主动开启图片加速时才会连接第三方
+ *   - 生成 / 复制 / 派生链接全部在本地完成，所有「打开」动作都走新标签页
+ */
+(function () {
+  'use strict';
+
+  const T = window.CTool;
+  const { $, escapeHtml, getPref, setPref, showToast, copyText, setStatus, bindCtrlEnter, debounce } = T;
+
+  const CUSTOM_KEY = 'githubCustomNodes';
+  const ENABLED_KEY = 'githubNodeEnabled';
+  const PROBE_KEY = 'githubProbeCache';
+  const BADGE_PREF_KEY = 'githubPageBadges';
+  const BADGE_STORAGE_KEY = 'ctoolGithubBadges';
+  const VISIT_PREF_KEY = 'githubVisitNode';
+  const VISIT_STORAGE_KEY = 'ctoolGithubVisitNode';
+  const VISIT_MIRROR_KEY = 'githubVisitMirrors';
+  const VISIT_PROBE_KEY = 'githubVisitProbe';
+  const NODE_POOL_VERSION_KEY = 'githubPoolVersion';
+  const NODE_POOL_VERSION = 2;
+  const AUTO_VISIT_PREF_KEY = 'githubAutoVisit';       /* 兼容旧偏好，只用于清除 */
+  const AUTO_VISIT_STORAGE_KEY = 'ctoolGithubAutoVisit';
+  const NEW_TAB_PREF_KEY = 'githubNewTabLinks';
+  const NEW_TAB_STORAGE_KEY = 'ctoolGithubNewTabLinks';
+  const IMAGE_BOOST_PREF_KEY = 'githubImageBoost';
+  const IMAGE_BOOST_STORAGE_KEY = 'ctoolGithubImageBoost';
+  const IMAGE_NODE_STORAGE_KEY = 'ctoolGithubImageNode';
+  /* 网页镜像站相关数据只保留纯函数与常量作兼容（T.github 导出），
+     界面、检测、域名替换与自动代理全部下线：githubfast.com 等站点实测
+     对浏览器 UA 返回 403「只允许 git / CLI」，保留入口只会误导用户。 */
+  const DEFAULT_VISIT_HOST = '';
+  const DEFAULT_IMAGE_NODE = 'https://gh-proxy.com';
+  const MIRROR_PROBE_URL = '/octocat/Hello-World';
+  const MIRROR_PROBE_TTL = 10 * 60 * 1000;
+  const BUILTIN_VISIT_MIRRORS = [
+    { host: 'githubfast.com', note: '仅 git / CLI，浏览器访问 403' },
+    { host: 'bgithub.xyz', note: '实测 403，可能已关停' },
+    { host: 'kkgithub.com', note: '实测 404 / 无法连接' },
+    { host: 'github.ur1.fun', note: '服务已暂停' },
+    { host: 'gitclone.com', note: '仅 clone，网页 502' },
+    { host: '521github.com', note: '广告跳转页，非镜像' },
+    { host: 'hub.yzuu.cf', note: '备用入口' },
+    { host: 'github.hscsec.cn', note: '备用入口' },
+    { host: 'hub.nuaa.cf', note: '备用入口' },
+    { host: 'g.nite07.org', note: '备用入口' }
+  ];
+  const PROBE_TTL = 5 * 60 * 1000;
+  const PROBE_TIMEOUT = 4000;
+  const PROBE_CONCURRENCY = 6;
+  const MAX_URLS = 20;
+  const SAMPLE_URL = 'https://raw.githubusercontent.com/octocat/Hello-World/master/README';
+  const EXAMPLE_URLS = [
+    'https://github.com/octocat/Hello-World/archive/refs/heads/master.zip',
+    'https://raw.githubusercontent.com/octocat/Hello-World/master/README'
+  ].join('\\n');
+
+  /* 下载代理节点池。2026-11-09 用真实 raw 文件逐项实测：
+     defaultOn = 返回 200 且内容正确、延迟 < 3s 的站点；其余仅作备用，默认停用。
+     实测失效的 gh.llkk.cc / gh.con.sh / gh.ddlc.top / github.geekery.cn /
+     gh.jasonzeng.dev / github.boki.moe / gh.h233.eu.org 已从池中移除。 */
+  const BUILTIN_NODES = [
+    { url: 'https://gh-proxy.com', region: '多国', defaultOn: true },
+    { url: 'https://edgeone.gh-proxy.org', region: '多国', defaultOn: true },
+    { url: 'https://gh.monlor.com', region: '美国', defaultOn: true },
+    { url: 'https://ghproxy.net', region: '英国', defaultOn: true },
+    { url: 'https://ghfast.top', region: '多国', defaultOn: true },
+    { url: 'https://githubproxy.cc', region: '多国', defaultOn: true },
+    { url: 'https://ghfile.geekertao.top', region: '美国', defaultOn: true },
+    { url: 'https://github.ednovas.xyz', region: '美国', defaultOn: true },
+    { url: 'https://hub.ddayh.com', region: '多国' },
+    { url: 'https://cdn.gh-proxy.org', region: '日本' },
+    { url: 'https://ghproxy.053000.xyz', region: '多国' },
+    { url: 'https://wget.la', region: '多国' },
+    { url: 'https://ghproxy.it', region: '美国' },
+    { url: 'https://ghp.keleyaa.com', region: '美国' },
+    { url: 'https://gh.chjina.com', region: '美国' },
+    { url: 'https://ghpxy.hwinzniej.top', region: '美国' },
+    { url: 'https://cdn.crashmc.com', region: '美国' },
+    { url: 'https://git.yylx.win', region: '美国' },
+    { url: 'https://gitproxy.mrhjx.cn', region: '美国' },
+    { url: 'https://ghproxy.cxkpro.top', region: '美国' },
+    { url: 'https://gh.xxooo.cf', region: '美国' },
+    { url: 'https://gh.idayer.com', region: '美国' },
+    { url: 'https://gh.zwy.one', region: '美国' },
+    { url: 'https://ghproxy.monkeyray.net', region: '美国' },
+    { url: 'https://hk.gh-proxy.org', region: '中国香港' },
+    { url: 'https://down.npee.cn/?', region: '美国' }
+  ];
+
+  const TYPE_LABELS = {
+    release: 'Release 附件',
+    archive: '源码归档',
+    raw: 'Raw 原始文件',
+    lfs: 'Git LFS 文件',
+    patch: 'Patch / Diff',
+    blob: '仓库文件',
+    tree: '目录页',
+    releasePage: 'Release 页面',
+    gist: 'Gist 链接',
+    repo: '仓库主页',
+    other: '其他 GitHub 链接'
+  };
+
+  /* ---------------- 纯函数（可单独测试） ---------------- */
+
+  function normalizeNodeUrl(value) {
+    let raw = String(value == null ? '' : value).trim();
+    if (!raw) return '';
+    /* 已写明协议但不是 http(s) 时直接拒绝，避免把 ftp:// 当成主机名补全 */
+    if (/^[a-z][a-z0-9+.-]*:\\/\\//i.test(raw) && !/^https?:\\/\\//i.test(raw)) return '';
+    if (!/^https?:\\/\\//i.test(raw)) raw = 'https://' + raw.replace(/^\\/+/, '');
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      return '';
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+    if (!parsed.hostname) return '';
+    /* 查询串式镜像（如 down.npee.cn/?）必须保留根斜杠与末尾的 ? = & */
+    const queryStyle = /[?=&]$/.test(raw);
+    let path = parsed.pathname.replace(/\\/+$/, '');
+    if (!path && queryStyle) path = '/';
+    let out = parsed.origin + path;
+    if (queryStyle) out += raw.slice(-1);
+    return out;
+  }
+
+  function nodeName(node) {
+    if (node && node.name) return node.name;
+    const url = node ? node.url : '';
+    try {
+      return new URL(url).hostname;
+    } catch (_) {
+      return String(url || '');
+    }
+  }
+
+  /* 与参考脚本 mirrorUrl 完全一致的拼接规则 */
+  function mirrorUrl(githubUrl, nodeUrl) {
+    if (!githubUrl || !nodeUrl) return '';
+    const node = String(nodeUrl).replace(/\\/+$/, '');
+    const sep = /[?=&]$/.test(node) ? '' : '/';
+    return node + sep + String(githubUrl).replace(/^\\/+/, '');
+  }
+
+  function extractUrl(text) {
+    const raw = String(text == null ? '' : text).trim();
+    if (!raw) return '';
+    const found = raw.match(/https?:\\/\\/[^\\s"'<>()]+/i) ||
+      raw.match(/git@github\\.com:[^\\s"'<>()]+/i) ||
+      raw.match(/(?:www\\.)?github\\.com\\/[^\\s"'<>()]+/i);
+    if (found) return found[0].replace(/^git\\s+clone\\s+/i, '');
+    return raw.split(/\\s+/)[0].replace(/^git\\s+clone\\s+/i, '');
+  }
+
+  function decodeSegment(value) {
+    try {
+      return decodeURIComponent(value);
+    } catch (_) {
+      return value;
+    }
+  }
+
+  function derivedLinks(info) {
+    const list = [];
+    const owner = info.owner;
+    const repo = info.repo;
+    if (!owner || !repo) return list;
+    const base = 'https://github.com/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo);
+    if (info.type === 'blob' && info.rawUrl) {
+      list.push({ label: '原始文件直链 (Raw)', url: info.rawUrl });
+    }
+    if (info.type === 'repo' || info.type === 'blob' || info.type === 'tree') {
+      list.push({ label: '源码包 ZIP · main', url: base + '/archive/refs/heads/main.zip' });
+      list.push({ label: '源码包 ZIP · master', url: base + '/archive/refs/heads/master.zip' });
+      list.push({ label: '源码包 TAR.GZ · main', url: base + '/archive/refs/heads/main.tar.gz' });
+      list.push({ label: '源码包 ZIP · HEAD', url: 'https://codeload.github.com/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/zip/HEAD' });
+      list.push({ label: '仓库克隆地址', url: base + '.git' });
+    }
+    return list;
+  }
+
+  function parseGithubLink(input) {
+    let url = extractUrl(input);
+    if (!url) return { ok: false, reason: 'empty', url: '' };
+
+    const ssh = url.match(/^git@github\\.com:([^\\s]+)$/i);
+    if (ssh) url = 'https://github.com/' + ssh[1];
+    if (/^(?:www\\.)?github\\.com\\//i.test(url)) url = 'https://' + url;
+    if (/^\\/\\//.test(url)) url = 'https:' + url;
+    url = url.replace(/[.,;，。、]+$/, '');
+
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_) {
+      return { ok: false, reason: 'invalid', url: url };
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return { ok: false, reason: 'scheme', url: url };
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    const isGithub = /(^|\\.)github\\.com$/.test(host) || /(^|\\.)githubusercontent\\.com$/.test(host);
+    if (!isGithub) return { ok: false, reason: 'host', url: url };
+
+    const path = parsed.pathname;
+    const segs = path.split('/').filter(Boolean).map(decodeSegment);
+    const owner = segs[0] && host.indexOf('githubusercontent.com') === -1 ? segs[0] : '';
+    const repo = segs[1] && host.indexOf('githubusercontent.com') === -1
+      ? segs[1].replace(/\\.git$/i, '')
+      : '';
+
+    let type = 'other';
+    if (/\\/releases\\/download\\//i.test(path) || /objects\\.githubusercontent\\.com$/.test(host)) type = 'release';
+    else if (host === 'codeload.github.com' || /\\/archive\\//i.test(path) || /\\/zipball\\//i.test(path) || /\\/tarball\\//i.test(path)) type = 'archive';
+    else if (/\\/info\\/lfs\\/objects\\//i.test(path) || /media\\.githubusercontent\\.com$/.test(host)) type = 'lfs';
+    else if (/raw\\.githubusercontent\\.com$/.test(host) || /\\/raw\\//i.test(path)) type = 'raw';
+    else if (/\\.(patch|diff)$/i.test(path)) type = 'patch';
+    else if (/\\/blob\\//i.test(path)) type = 'blob';
+    else if (/\\/tree\\//i.test(path)) type = 'tree';
+    else if (/\\/releases(\\/|$)/i.test(path) || /\\/tags(\\/|$)/i.test(path)) type = 'releasePage';
+    else if (/gist\\.github\\.com$/.test(host) || /gist\\.githubusercontent\\.com$/.test(host)) type = 'gist';
+    else if (segs.length === 2) type = 'repo';
+
+    let rawUrl = '';
+    if (type === 'raw' && /raw\\.githubusercontent\\.com$/.test(host)) {
+      rawUrl = parsed.href;
+    } else if (type === 'raw' || type === 'blob') {
+      /* github.com/u/r/raw|blob/<ref>/<path> → raw.githubusercontent.com/u/r/<ref>/<path> */
+      const marker = type === 'blob' ? 'blob' : 'raw';
+      const index = segs.indexOf(marker);
+      const ref = segs[index + 1] || 'HEAD';
+      const rest = segs.slice(index + 2).join('/');
+      rawUrl = 'https://raw.githubusercontent.com/' + encodeURIComponent(owner) + '/' +
+        encodeURIComponent(repo) + '/' + ref + (rest ? '/' + rest : '');
+    }
+
+    let filename = '';
+    if (type !== 'repo' && type !== 'releasePage' && type !== 'tree' && type !== 'other') {
+      filename = segs.length ? segs[segs.length - 1] : '';
+    }
+
+    const hints = {
+      repo: '仓库主页不是文件直链。下方已派生源码包与克隆地址，可直接加速；也可以粘贴具体的 Release 附件链接。',
+      blob: '文件查看页已自动转换为 Raw 直链；若分支名本身含斜杠，请手动修正派生链接。',
+      tree: '目录页不能直接下载，请改用源码包或具体文件链接。',
+      releasePage: 'Release 列表页不能直接下载，请复制具体附件的下载直链（含 /releases/download/）。',
+      gist: 'Gist 链接按原样拼接镜像前缀，Raw 链接的加速效果最好。',
+      other: '未识别的 GitHub 链接类型，将按「镜像前缀 + 原链接」原样转换。'
+    };
+
+    const info = {
+      ok: true,
+      url: parsed.href,
+      host: host,
+      type: type,
+      typeLabel: TYPE_LABELS[type] || TYPE_LABELS.other,
+      filename: filename,
+      owner: owner,
+      repo: repo,
+      rawUrl: rawUrl,
+      hint: hints[type] || '',
+      target: rawUrl || parsed.href
+    };
+    info.derived = derivedLinks(info);
+    return info;
+  }
+
+  function cloneCommands(repoUrl, nodeUrl) {
+    const base = mirrorUrl(repoUrl, nodeUrl);
+    const queryNode = /[?=&]$/.test(String(nodeUrl).replace(/\\/+$/, ''));
+    const prefix = mirrorUrl('https://github.com/', nodeUrl).replace(/\\/+$/, '') + '/';
+    return {
+      clone: 'git clone ' + base,
+      insteadOf: queryNode
+        ? ''
+        : 'git config --global url."' + prefix + '".insteadOf "https://github.com/"'
+    };
+  }
+
+  /* 访问加速：网页链接保留原始页面地址，不做 blob → raw 转换。
+     文件直链（Release / 源码包 / Raw / LFS / Patch）走「加速直链」更合适。 */
+  function isVisitUrl(input) {
+    const info = parseGithubLink(input);
+    if (!info.ok) return false;
+    if (!/(^|\\.)github\\.com$/.test(info.host)) return false;
+    return ['repo', 'blob', 'tree', 'releasePage', 'gist', 'other'].indexOf(info.type) >= 0;
+  }
+
+  /* 网页镜像站只接受纯域名。旧版偏好里存的是下载代理前缀 URL（含 ://），
+     直接判为无效并回退默认，避免把 gh-proxy.com 误当成能浏览网页的镜像站。 */
+  function normalizeVisitHost(value) {
+    const raw = String(value == null ? '' : value).trim().toLowerCase();
+    if (!raw || raw === 'auto' || raw.indexOf('://') !== -1 || /[/?#\\\\]/.test(raw)) return '';
+    if (!/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z]{2,}$/.test(raw)) return '';
+    return raw;
+  }
+
+  function visitMirrorOptions() {
+    const custom = getPref(VISIT_MIRROR_KEY, []);
+    const list = BUILTIN_VISIT_MIRRORS.map((item) => ({
+      host: item.host, note: T.t(item.note), custom: false
+    }));
+    if (Array.isArray(custom)) {
+      custom.forEach((value) => {
+        const host = normalizeVisitHost(value);
+        if (host && !list.some((item) => item.host === host)) {
+          list.push({ host: host, note: T.t('自定义'), custom: true });
+        }
+      });
+    }
+    return list;
+  }
+
+  /* 同构镜像站是「替换域名」：https://github.com/u/r → https://<mirror>/u/r。
+     文件代理节点是「前缀拼接」，只能转发文件字节，不返回 HTML，不能用于浏览网页。 */
+  function visitUrl(pageUrl, mirrorHost) {
+    const host = normalizeVisitHost(mirrorHost);
+    /* 没有可用镜像站时不拼假地址：返回空，由调用方回退直连原链接 */
+    if (!host) return '';
+    let parsed;
+    try {
+      parsed = new URL(String(pageUrl));
+    } catch (_) {
+      return '';
+    }
+    if (!/^https?:$/i.test(parsed.protocol)) return '';
+    /* 同构镜像站只代理 github.com 主域；gist / raw 等子域返回空，由调用方提示 */
+    if (!/^(?:www\\.)?github\\.com$/i.test(parsed.hostname)) return '';
+    parsed.hostname = host;
+    return parsed.href;
+  }
+
+  function visitLinks(inputs, mirrorHost) {
+    const host = normalizeVisitHost(mirrorHost);
+    const list = Array.isArray(inputs) ? inputs : [];
+    return list.slice(0, MAX_URLS).map((line) => parseGithubLink(line))
+      .filter((info) => info.ok)
+      .map((info) => {
+        const target = visitUrl(info.url, host);
+        return {
+          original: info.url,
+          type: info.type,
+          typeLabel: info.typeLabel,
+          pageLink: isVisitUrl(info.url),
+          mirrored: !!target,
+          mirrorHost: host,
+          /* 不支持的域名保留原链接，避免生成一条打不开的假镜像地址 */
+          url: target || info.url
+        };
+      });
+  }
+
+  /* ---------------- 兼容保留的纯函数（访问加速已下线，界面不再调用） ---------------- */
+
+  /* 检测结果缓存 10 分钟，避免每次打开工具都联网。只有点击「检测」才主动请求。 */
+  function readMirrorProbe() {
+    const raw = getPref(VISIT_PROBE_KEY, {});
+    const out = {};
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      Object.keys(raw).forEach((host) => {
+        const item = raw[host];
+        if (item && typeof item.ok === 'boolean' && Date.now() - Number(item.at || 0) < MIRROR_PROBE_TTL) {
+          out[host] = item.ok === true;
+        }
+      });
+    }
+    return out;
+  }
+
+  function saveMirrorProbe(results) {
+    const raw = getPref(VISIT_PROBE_KEY, {});
+    const out = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? Object.assign({}, raw) : {};
+    Object.keys(results).forEach((host) => {
+      out[host] = { ok: results[host] === true, at: Date.now() };
+    });
+    setPref(VISIT_PROBE_KEY, out);
+  }
+
+  function hasBackgroundBridge() {
+    return typeof chrome !== 'undefined' && chrome.runtime &&
+      typeof chrome.runtime.sendMessage === 'function' &&
+      typeof chrome.runtime.id === 'string' && chrome.runtime.id !== 'ctool-userjs';
+  }
+
+  /* 扩展页优先走后台 service worker（不受第三方站点 CORS 限制），
+     后台不可用时退回页面 fetch；油猴 iframe 走宿主 GM_xmlhttpRequest 桥。 */
+  function ghFetch(url, timeoutMs) {
+    const direct = () => (typeof fetch === 'function'
+      ? fetch(url, { method: 'GET', credentials: 'omit' })
+      : Promise.reject(new Error('fetch unavailable')));
+    let request;
+    if (typeof T.aiFetch === 'function') {
+      request = T.aiFetch(url, { method: 'GET', headers: { Accept: 'text/html' } });
+    } else if (hasBackgroundBridge()) {
+      request = new Promise((resolve, reject) => {
+        try {
+          const sent = chrome.runtime.sendMessage(
+            { type: 'ctool-ai-fetch', url: url, method: 'GET', headers: {} },
+            (data) => {
+              if (!data || typeof data.ok !== 'boolean') { reject(new Error('background unavailable')); return; }
+              resolve({ ok: data.ok, status: data.status, text: () => Promise.resolve(String(data.text || '')) });
+            }
+          );
+          if (sent && typeof sent.catch === 'function') sent.catch(reject);
+        } catch (error) { reject(error); }
+      }).catch(direct);
+    } else {
+      request = direct();
+    }
+    return Promise.race([
+      request,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs || 6000))
+    ]);
+  }
+
+  /* 只认真正返回 GitHub 仓库页 HTML 的站点：
+     403 提示页、Loading 跳转页、广告导航页、代理首页都不算可用。 */
+  function looksLikeGithubPage(text) {
+    const body = String(text || '');
+    return /Hello-World/i.test(body) &&
+      /(github\\.githubassets|data-color-mode|Sign in|octocat)/i.test(body);
+  }
+
+  /* ---------------- 节点状态 ---------------- */
+
+  function loadNodes() {
+    /* 节点池改版时丢弃旧启用状态，避免已失效的节点继续参与默认测速 */
+    if (getPref(NODE_POOL_VERSION_KEY, 0) !== NODE_POOL_VERSION) {
+      setPref(ENABLED_KEY, {});
+      setPref(VISIT_PREF_KEY, 'auto');
+      setPref(NODE_POOL_VERSION_KEY, NODE_POOL_VERSION);
+    }
+    const custom = getPref(CUSTOM_KEY, []);
+    const enabled = getPref(ENABLED_KEY, {});
+    const states = enabled && typeof enabled === 'object' && !Array.isArray(enabled) ? enabled : {};
+    const list = BUILTIN_NODES.map((node) => Object.assign({}, node, {
+      custom: false,
+      enabled: typeof states[node.url] === 'boolean' ? states[node.url] : !!node.defaultOn
+    }));
+    if (Array.isArray(custom)) {
+      custom.forEach((node) => {
+        if (!node || typeof node.url !== 'string') return;
+        const url = normalizeNodeUrl(node.url);
+        if (!url || BUILTIN_NODES.some((item) => item.url === url)) return;
+        if (list.some((item) => item.url === url)) return;
+        list.push({
+          url: url,
+          name: typeof node.name === 'string' && node.name ? node.name : '',
+          region: '自定义',
+          custom: true,
+          defaultOn: true,
+          enabled: typeof states[url] === 'boolean' ? states[url] : true
+        });
+      });
+    }
+    return list;
+  }
+
+  function saveNodes(nodes) {
+    const states = {};
+    nodes.forEach((node) => { states[node.url] = !!node.enabled; });
+    setPref(ENABLED_KEY, states);
+    setPref(CUSTOM_KEY, nodes.filter((node) => node.custom).map((node) => ({
+      url: node.url,
+      name: node.name || ''
+    })));
+  }
+
+  function readProbe() {
+    const value = getPref(PROBE_KEY, {});
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  }
+
+  function probeFresh(record) {
+    return !!(record && record.ok && typeof record.ms === 'number' &&
+      typeof record.at === 'number' && Date.now() - record.at < PROBE_TTL);
+  }
+
+  /* ---------------- 网络（仅在用户点击测速时触发） ---------------- */
+
+  const IS_EXTENSION = typeof location !== 'undefined' && location.protocol === 'chrome-extension:';
+
+  function probeNode(nodeUrl, target, timeoutMs) {
+    const url = mirrorUrl(target, nodeUrl);
+    const timeout = timeoutMs || PROBE_TIMEOUT;
+    const started = Date.now();
+    let controller = null;
+    if (typeof AbortController === 'function') controller = new AbortController();
+    let timer = null;
+
+    const attempt = new Promise((resolve) => {
+      const finish = (result) => resolve(Object.assign({ ms: Date.now() - started }, result));
+      const base = { method: 'HEAD', cache: 'no-store' };
+      if (controller) base.signal = controller.signal;
+      if (!IS_EXTENSION) base.mode = 'no-cors';
+
+      const fallback = (firstError) => {
+        /* 扩展页有 host_permissions，但部分镜像不返回 CORS 头；
+           no-cors 仍可判断 TCP/TLS 是否连通，只是拿不到状态码。 */
+        if (!IS_EXTENSION || typeof fetch !== 'function') {
+          finish({ ok: false, error: (firstError && firstError.message) || '请求失败' });
+          return;
+        }
+        try {
+          fetch(url, { method: 'HEAD', mode: 'no-cors', cache: 'no-store', signal: controller ? controller.signal : undefined })
+            .then(() => finish({ ok: true, status: 0, opaque: true }))
+            .catch((error) => finish({ ok: false, error: (error && error.message) || '请求失败' }));
+        } catch (error) {
+          finish({ ok: false, error: (error && error.message) || '请求失败' });
+        }
+      };
+
+      try {
+        fetch(url, base)
+          .then((response) => {
+            /* 405 / 501 只是不支持 HEAD，按参考脚本的处理不算节点失效。 */
+            const unsupported = response.status === 405 || response.status === 501;
+            finish({
+              ok: response.ok || response.type === 'opaque' || unsupported,
+              status: response.status,
+              opaque: response.type === 'opaque',
+              unsupported: unsupported
+            });
+          })
+          .catch(fallback);
+      } catch (error) {
+        fallback(error);
+      }
+    });
+
+    const guard = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        if (controller) controller.abort();
+        resolve({ ok: false, ms: timeout, error: '超时' });
+      }, timeout);
+    });
+
+    return Promise.race([attempt, guard]).then((result) => {
+      if (timer) clearTimeout(timer);
+      return result;
+    });
+  }
+
+  /* ---------------- 工具页面 ---------------- */
+
+  /* 下列 visit* / mirrorProbe* 纯函数保留给旧的自动化检查与第三方调用，
+     不再对应任何界面入口，也不会产生域名替换或第三方请求。 */
+  T.github = {
+    normalizeNodeUrl: normalizeNodeUrl,
+    nodeName: nodeName,
+    mirrorUrl: mirrorUrl,
+    extractUrl: extractUrl,
+    parseGithubLink: parseGithubLink,
+    derivedLinks: derivedLinks,
+    cloneCommands: cloneCommands,
+    isVisitUrl: isVisitUrl,
+    visitUrl: visitUrl,
+    visitLinks: visitLinks,
+    normalizeVisitHost: normalizeVisitHost,
+    visitMirrorOptions: visitMirrorOptions,
+    looksLikeGithubPage: looksLikeGithubPage,
+    readMirrorProbe: readMirrorProbe,
+    ghFetch: ghFetch,
+    mirrorProbeUrl: MIRROR_PROBE_URL,
+    builtinNodes: BUILTIN_NODES,
+    builtinVisitMirrors: BUILTIN_VISIT_MIRRORS,
+    defaultVisitHost: DEFAULT_VISIT_HOST,
+    defaultImageNode: DEFAULT_IMAGE_NODE
+  };
+
+  T.renderers.github = function renderGithub(root, ctx) {
+    const context = ctx || {};
+    const state = {
+      nodes: loadNodes(),
+      probe: readProbe(),
+      parsed: [],
+      links: [],
+      expanded: new Set(),
+      disposed: false,
+      busy: false
+    };
+
+    root.innerHTML = \`
+      <div class="stack gh-page">
+        <section class="card">
+          <div class="card-head">
+            <div class="card-heading"><span class="card-icon" data-no-i18n>GH</span><h2>GitHub 链接</h2></div>
+            <span class="status" id="gh-status"></span>
+          </div>
+          <div class="card-body">
+            <textarea id="gh-input" class="code-area gh-input" spellcheck="false" placeholder="粘贴 GitHub 链接，一行一个（最多 20 行）…"></textarea>
+            <div class="gh-main-actions">
+              <button class="btn btn-primary" type="button" data-act="generate">⚡ 一键加速 <kbd>Ctrl ↵</kbd></button>
+              <button class="btn btn-sm" type="button" data-act="probe">测速</button>
+              <button class="btn btn-sm" type="button" data-act="sample">示例</button>
+              <button class="btn btn-sm" type="button" data-act="clear-input">清空</button>
+              <button class="btn btn-sm" type="button" data-act="from-page">当前页</button>
+              <button class="btn btn-sm" type="button" data-act="scan-page">扫描本页</button>
+            </div>
+            <div class="gh-quick-hint">粘贴 GitHub 文件 / 仓库链接，点一次即可生成加速直链；结果都在下方「加速结果」。</div>
+          </div>
+        </section>
+
+        <div class="tabs" role="tablist">
+          <button class="tab active" type="button" data-tab="results" role="tab" aria-selected="true">加速结果</button>
+          <button class="tab" type="button" data-tab="settings" role="tab" aria-selected="false">设置与说明</button>
+        </div>
+
+        <div data-panel="results">
+          <section class="card">
+            <div class="card-head">
+              <div class="card-heading"><span class="card-icon" data-no-i18n>↓</span><h2>下载加速</h2></div>
+              <span class="badge" id="gh-count">尚未生成</span>
+            </div>
+            <div class="card-body">
+              <div id="gh-results" class="gh-results"></div>
+            </div>
+            <div class="card-foot">
+              <button class="btn btn-sm" type="button" data-act="copy-all">复制全部</button>
+              <button class="btn btn-sm" type="button" data-act="copy-fastest">复制最快</button>
+              <button class="btn btn-sm" type="button" data-act="download-fastest">下载最快</button>
+            </div>
+          </section>
+
+          <details class="gh-details" id="gh-derived-card" hidden>
+            <summary>派生链接与 git clone 命令</summary>
+            <div class="card-body">
+              <div id="gh-derived" class="gh-derived"></div>
+              <div class="gh-command">
+                <div class="gh-command-head"><span>克隆单个仓库</span><button class="btn btn-sm" type="button" data-act="copy-clone">复制</button></div>
+                <code id="gh-clone-cmd" data-no-i18n></code>
+              </div>
+              <div class="gh-command">
+                <div class="gh-command-head"><span>全局替换</span><button class="btn btn-sm" type="button" data-act="copy-insteadof">复制</button></div>
+                <code id="gh-insteadof-cmd" data-no-i18n></code>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <div data-panel="settings" hidden>
+          <details class="gh-details" open>
+            <summary>下载代理节点 <span class="badge" id="gh-node-count"></span></summary>
+            <div class="card-body">
+              <div class="gh-add-row">
+                <input class="input" id="gh-new-node" type="url" placeholder="自定义前缀，如 https://mirror.example.com/" autocomplete="off">
+                <button class="btn btn-primary" type="button" data-act="add-node">添加节点</button>
+              </div>
+              <div id="gh-node-list" class="gh-node-list"></div>
+              <div class="gh-mini-actions">
+                <button class="btn btn-sm" type="button" data-act="enable-all">启用全部</button>
+                <button class="btn btn-sm" type="button" data-act="reset-nodes">恢复默认</button>
+              </div>
+              <div class="gh-quick-hint">内置节点已于 2026-11 用真实文件复测，默认只启用返回 200 且内容正确的站点；测速会向节点发送一次 HEAD 请求。</div>
+            </div>
+          </details>
+
+          <details class="gh-details">
+            <summary>页面图标与资源加速</summary>
+            <div class="card-body">
+              <label class="gh-page-switch">
+                <input type="checkbox" id="gh-page-badges" checked>
+                <span>在 GitHub 页面下载链接旁显示 ⚡ / ↓ 图标</span>
+              </label>
+              <label class="gh-page-switch">
+                <input type="checkbox" id="gh-new-tab-links" checked>
+                <span>GitHub 站内链接默认在新标签页打开（只拦截点击，不改写原链接）</span>
+              </label>
+              <label class="gh-page-switch">
+                <input type="checkbox" id="gh-image-boost">
+                <span>加速页面内 GitHub 图片 / Raw 资源</span>
+              </label>
+              <div class="gh-quick-hint">图片 / Raw 属于文件，走上面的下载代理；网页访问加速已下线，站内链接直接在新标签页打开，不会跳到第三方镜像站。</div>
+            </div>
+          </details>
+
+          <details class="gh-details">
+            <summary>说明与隐私</summary>
+            <div class="card-body gh-help">
+              <ol>
+                <li>粘贴 GitHub 链接点「一键加速」生成下载直链；结果里的「打开」按钮一律在新标签页打开。</li>
+                <li>点「测速」才联网探测节点延迟，结果本机缓存 5 分钟；其余转换全部在本机完成。</li>
+                <li>不想复制粘贴，可在 GitHub 页面点下载链接旁的 ⚡ / ↓ 图标，或右键使用 CTool 菜单。</li>
+                <li>网页镜像站实测普遍关停或只允许 git / CLI，因此已移除「加速访问此页面」；站内链接改为新标签页直连 github.com。</li>
+              </ol>
+              <div class="notice warn gh-notice">加速节点是第三方服务：使用加速链接或测速时对方能看到完整 GitHub 链接，私有仓库与带鉴权参数的链接请勿使用。</div>
+            </div>
+          </details>
+        </div>
+      </div>
+    \`;
+
+    const input = $('#gh-input', root);
+    const status = $('#gh-status', root);
+    const results = $('#gh-results', root);
+    const derivedBox = $('#gh-derived', root);
+    const derivedCard = $('#gh-derived-card', root);
+    const nodeList = $('#gh-node-list', root);
+    const newNode = $('#gh-new-node', root);
+    const countBadge = $('#gh-count', root);
+    const nodeCountBadge = $('#gh-node-count', root);
+    const badgeToggle = $('#gh-page-badges', root);
+    const newTabToggle = $('#gh-new-tab-links', root);
+    const imageBoostToggle = $('#gh-image-boost', root);
+    let downloadAckTimer = null;
+    const tabs = T.setupTabs(root);
+
+    function applyI18n(container) {
+      if (T.i18n && T.i18n.apply) T.i18n.apply(container);
+    }
+
+    function enabledNodes() {
+      return state.nodes.filter((node) => node.enabled);
+    }
+
+    function preferredNode() {
+      const list = enabledNodes();
+      if (!list.length) return null;
+      const scored = list.slice().sort((a, b) => {
+        const ra = state.probe[a.url];
+        const rb = state.probe[b.url];
+        const oa = probeFresh(ra) ? 0 : 1;
+        const ob = probeFresh(rb) ? 0 : 1;
+        if (oa !== ob) return oa - ob;
+        if (oa === 0) return (ra.ms || 0) - (rb.ms || 0);
+        return 0;
+      });
+      return scored[0];
+    }
+
+    function probeBadge(url) {
+      const record = state.probe[url];
+      if (!record) return '<span class="gh-probe">未测速</span>';
+      if (!probeFresh(record) || !record.ok) return '<span class="gh-probe bad">不可用</span>';
+      const note = record.status === 0 || record.opaque ? ' · 仅连通' : '';
+      return '<span class="gh-probe ok">' + escapeHtml(record.ms + ' ms' + note) + '</span>';
+    }
+
+    function sortLinks() {
+      state.links.sort((a, b) => {
+        if (a.pi !== b.pi) return a.pi - b.pi;
+        const ra = state.probe[a.nodeUrl];
+        const rb = state.probe[b.nodeUrl];
+        const oa = probeFresh(ra) ? 0 : 1;
+        const ob = probeFresh(rb) ? 0 : 1;
+        if (oa !== ob) return oa - ob;
+        if (oa === 0) return (ra.ms || 0) - (rb.ms || 0);
+        return a.order - b.order;
+      });
+      state.links.forEach((link, index) => { link.id = index; });
+    }
+
+    function renderResults() {
+      if (!state.parsed.length) {
+        results.innerHTML = '<div class="gh-empty">粘贴链接后点击「生成加速直链」，结果会显示在这里。</div>';
+        countBadge.textContent = T.t('尚未生成');
+        derivedCard.hidden = true;
+        applyI18n(results);
+        return;
+      }
+
+      let html = '';
+      state.parsed.forEach((info, pi) => {
+        const group = state.links.filter((link) => link.pi === pi);
+        const expanded = state.expanded.has(pi) || group.length <= 1;
+        const shown = expanded ? group : group.slice(0, 1);
+        html += '<div class="gh-group">';
+        html += '<div class="gh-group-head">';
+        html += '<span class="badge badge-accent">' + escapeHtml(T.t(info.typeLabel)) + '</span>';
+        html += '<code class="gh-origin" data-no-i18n>' + escapeHtml(info.url) + '</code>';
+        if (info.filename) html += '<span class="gh-filename" data-no-i18n>' + escapeHtml(info.filename) + '</span>';
+        html += '</div>';
+        if (info.hint) html += '<div class="gh-hint">' + escapeHtml(T.t(info.hint)) + '</div>';
+        html += '<div class="gh-link-list">';
+        shown.forEach((link) => {
+          const fastest = link === group[0] && group.length > 1;
+          html += '<div class="gh-link-row">';
+          html += '<div class="gh-link-meta">';
+          html += '<strong class="gh-node-name" data-no-i18n>' + escapeHtml(link.nodeName) + '</strong>';
+          html += '<span class="gh-region">' + escapeHtml(T.t(link.region)) + '</span>';
+          html += probeBadge(link.nodeUrl);
+          if (fastest) html += '<span class="gh-fast">首选</span>';
+          html += '</div>';
+          html += '<code class="gh-link-url" data-no-i18n>' + escapeHtml(link.url) + '</code>';
+          html += '<div class="gh-link-actions">';
+          html += '<button class="btn btn-sm" type="button" data-act="copy-link" data-i="' + link.id + '">复制</button>';
+          html += '<button class="btn btn-sm" type="button" data-act="open-link" data-i="' + link.id + '">打开</button>';
+          html += '<button class="btn btn-sm btn-primary" type="button" data-act="download-link" data-i="' + link.id + '">下载</button>';
+          html += '</div>';
+          html += '</div>';
+        });
+        html += '</div>';
+        if (group.length > 1) {
+          html += '<button class="btn btn-sm gh-expand" type="button" data-act="expand" data-pi="' + pi + '">' +
+            escapeHtml(T.t(expanded ? '收起镜像' : '展开全部 ' + group.length + ' 个镜像')) + '</button>';
+        }
+        html += '</div>';
+      });
+
+      results.innerHTML = html;
+      countBadge.textContent = T.t('已生成 ' + state.links.length + ' 条镜像直链');
+      applyI18n(results);
+
+      const allDerived = state.parsed.reduce((list, info) => list.concat(info.derived || []), []);
+      derivedCard.hidden = allDerived.length === 0;
+      derivedBox.innerHTML = allDerived.map((item, index) =>
+        '<div class="gh-derived-row">' +
+          '<span class="gh-derived-label">' + escapeHtml(T.t(item.label)) + '</span>' +
+          '<code class="gh-derived-url" data-no-i18n>' + escapeHtml(item.url) + '</code>' +
+          '<button class="btn btn-sm" type="button" data-act="copy-derived" data-i="' + index + '">复制</button>' +
+          '<button class="btn btn-sm" type="button" data-act="use-derived" data-i="' + index + '">生成加速直链</button>' +
+        '</div>'
+      ).join('');
+      state.derived = allDerived;
+      applyI18n(derivedBox);
+    }
+
+    function renderNodes() {
+      nodeList.innerHTML = state.nodes.map((node, index) =>
+        '<div class="gh-node-row">' +
+          '<label class="gh-node-check"><input type="checkbox" data-act="toggle" data-i="' + index + '"' + (node.enabled ? ' checked' : '') + ' aria-label="启用节点"></label>' +
+          '<div class="gh-node-info">' +
+            '<strong data-no-i18n>' + escapeHtml(nodeName(node)) + '</strong>' +
+            '<code data-no-i18n>' + escapeHtml(node.url) + '</code>' +
+          '</div>' +
+          '<span class="badge">' + escapeHtml(T.t(node.region)) + '</span>' +
+          probeBadge(node.url) +
+          (node.custom
+            ? '<button class="btn btn-sm" type="button" data-act="remove-node" data-i="' + index + '">删除</button>'
+            : '<span class="gh-node-builtin">内置</span>') +
+        '</div>'
+      ).join('');
+      nodeCountBadge.textContent = T.t('已启用 ' + enabledNodes().length + ' / ' + state.nodes.length + ' 个节点');
+      applyI18n(nodeList);
+    }
+
+    function renderCommands() {
+      const node = preferredNode();
+      const clone = $('#gh-clone-cmd', root);
+      const insteadOf = $('#gh-insteadof-cmd', root);
+      if (!node) {
+        clone.textContent = T.t('请先在「镜像节点」中启用至少一个节点');
+        insteadOf.textContent = T.t('请先在「镜像节点」中启用至少一个节点');
+        return;
+      }
+      const repoUrl = state.parsed.length && state.parsed[0].repo
+        ? 'https://github.com/' + state.parsed[0].owner + '/' + state.parsed[0].repo + '.git'
+        : 'https://github.com/owner/repo.git';
+      const commands = cloneCommands(repoUrl, node.url);
+      clone.textContent = commands.clone;
+      insteadOf.textContent = commands.insteadOf || T.t('该节点为查询串式前缀，不支持全局 insteadOf 配置');
+    }
+
+    /* ---------------- 页面设置与图片加速 ---------------- */
+
+    /* 图片 / Raw 资源属于文件，仍使用下载代理池的首选前缀 */
+    function resolveImageNode() {
+      const best = preferredNode();
+      return best ? best.url : DEFAULT_IMAGE_NODE;
+    }
+
+    function inputLines() {
+      return input.value.split(/\\r?\\n/).map((line) => line.trim()).filter(Boolean).slice(0, MAX_URLS);
+    }
+
+    async function getSourcePageUrl() {
+      let pageUrl = context.pageUrl || '';
+      try {
+        if (typeof chrome !== 'undefined' && chrome.tabs) {
+          let tab = null;
+          if (typeof chrome.storage !== 'undefined' && chrome.storage.local && chrome.storage.local.get) {
+            const saved = await chrome.storage.local.get('ctool_source_tab');
+            const id = saved && saved.ctool_source_tab;
+            if (typeof id === 'number' && chrome.tabs.get) {
+              try { tab = await chrome.tabs.get(id); } catch (_) { tab = null; }
+            }
+          }
+          if (!tab && chrome.tabs.query) {
+            const list = await chrome.tabs.query({ active: true, currentWindow: true });
+            tab = list && list[0];
+          }
+          if (tab && tab.url) pageUrl = tab.url;
+        }
+      } catch (_) {
+        /* 非扩展环境或权限不足时沿用任务带入的 pageUrl */
+      }
+      return pageUrl;
+    }
+
+    function pageSettings() {
+      return {
+        newTabLinks: newTabToggle ? !!newTabToggle.checked : true,
+        imageBoost: imageBoostToggle ? !!imageBoostToggle.checked : false,
+        /* 旧偏好一律清空，避免老版内容脚本继续做域名替换 / 自动代理 */
+        autoVisit: false,
+        visitMirror: '',
+        imageNode: resolveImageNode()
+      };
+    }
+
+    function broadcastPageSettings() {
+      const settings = pageSettings();
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local && chrome.storage.local.set) {
+          const payload = {};
+          payload[NEW_TAB_STORAGE_KEY] = settings.newTabLinks;
+          payload[IMAGE_BOOST_STORAGE_KEY] = settings.imageBoost;
+          payload[AUTO_VISIT_STORAGE_KEY] = false;
+          payload[VISIT_STORAGE_KEY] = '';
+          payload[IMAGE_NODE_STORAGE_KEY] = settings.imageNode;
+          chrome.storage.local.set(payload);
+        }
+      } catch (_) {
+        // 忽略存储错误。
+      }
+      /* 油猴版宿主不监听 storage，用消息即时同步 */
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage(Object.assign({ type: 'ctool-github-visit-settings' }, settings), '*');
+        }
+      } catch (_) {
+        // 忽略消息失败。
+      }
+      return settings;
+    }
+
+    function initPageSettings() {
+      if (newTabToggle) newTabToggle.checked = getPref(NEW_TAB_PREF_KEY, true) !== false;
+      if (imageBoostToggle) imageBoostToggle.checked = getPref(IMAGE_BOOST_PREF_KEY, false) === true;
+      /* 旧版开关清零，页面上的 🌐 / 自动代理入口不会再被旧偏好唤醒 */
+      setPref(AUTO_VISIT_PREF_KEY, false);
+      setPref(VISIT_PREF_KEY, '');
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local && chrome.storage.local.get) {
+          Promise.resolve(chrome.storage.local.get([NEW_TAB_STORAGE_KEY, IMAGE_BOOST_STORAGE_KEY]))
+            .then((result) => {
+              if (state.disposed || !result) return;
+              if (typeof result[NEW_TAB_STORAGE_KEY] === 'boolean' && newTabToggle) {
+                newTabToggle.checked = result[NEW_TAB_STORAGE_KEY];
+              }
+              if (typeof result[IMAGE_BOOST_STORAGE_KEY] === 'boolean' && imageBoostToggle) {
+                imageBoostToggle.checked = result[IMAGE_BOOST_STORAGE_KEY];
+              }
+            }).catch(() => {});
+        }
+      } catch (_) {
+        // 存储不可用时沿用本机偏好。
+      }
+    }
+
+    function generate() {
+      const lines = input.value.split(/\\r?\\n/).map((line) => line.trim()).filter(Boolean).slice(0, MAX_URLS);
+      state.parsed = [];
+      state.links = [];
+      state.expanded = new Set();
+      const errors = [];
+      lines.forEach((line) => {
+        const info = parseGithubLink(line);
+        if (!info.ok) {
+          errors.push(line);
+          return;
+        }
+        state.parsed.push(info);
+      });
+
+      const nodes = enabledNodes();
+      let order = 0;
+      state.parsed.forEach((info, pi) => {
+        nodes.forEach((node) => {
+          state.links.push({
+            id: 0,
+            order: order++,
+            pi: pi,
+            nodeUrl: node.url,
+            nodeName: nodeName(node),
+            region: node.region,
+            filename: info.filename,
+            url: mirrorUrl(info.target, node.url)
+          });
+        });
+      });
+      sortLinks();
+      if (state.parsed.length === 1) state.expanded.add(0);
+
+      renderResults();
+      renderCommands();
+      renderNodes();
+
+      if (!lines.length) {
+        setStatus(status, '', '');
+      } else if (!nodes.length) {
+        setStatus(status, T.t('没有启用的镜像节点，请先在「镜像节点」中启用'), 'warn');
+      } else if (errors.length) {
+        setStatus(status, T.t('已跳过 ' + errors.length + ' 个非 GitHub 链接'), 'warn');
+      } else {
+        setStatus(status, T.t('✓ 已生成 ' + state.links.length + ' 条镜像直链'), 'ok');
+      }
+      return state.links.length;
+    }
+
+    function refreshLinksOnly() {
+      sortLinks();
+      renderResults();
+      renderNodes();
+      renderCommands();
+    }
+
+    function deliver(url, filename) {
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      /* 即使没有文件名也保留 download 属性，否则浏览器会把当前工具箱页导航到镜像地址 */
+      anchor.download = filename || '';
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      setTimeout(() => anchor.remove(), 1000);
+    }
+
+    /* 所有「打开」动作统一走新标签页，绝不把工具箱 / 小窗 iframe 导航走。
+       小窗与油猴 iframe 优先交给宿主桥（chrome.tabs.create / GM_openInTab），
+       宿主没有回执时回退到 window.open；任何兜底都带 target="_blank"。 */
+    let newTabAckTimer = null;
+
+    function openLinkFallback(url) {
+      let opened = null;
+      try {
+        opened = window.open(url, '_blank', 'noopener,noreferrer');
+      } catch (_) {
+        opened = null;
+      }
+      if (opened) {
+        try { opened.opener = null; } catch (_) { /* 跨域窗口不可写，忽略 */ }
+        return;
+      }
+      try {
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+        anchor.style.display = 'none';
+        document.body.appendChild(anchor);
+        anchor.click();
+        setTimeout(() => anchor.remove(), 1000);
+      } catch (_) {
+        copyText(url);
+        setStatus(status, T.t('新标签页被浏览器拦截，链接已复制，请手动打开'), 'warn');
+      }
+    }
+
+    function openLink(url) {
+      const target = String(url || '');
+      if (!/^https?:\\/\\//i.test(target)) {
+        copyText(target);
+        setStatus(status, T.t('新标签页被浏览器拦截，链接已复制，请手动打开'), 'warn');
+        return;
+      }
+      if (window.parent && window.parent !== window) {
+        try {
+          window.parent.postMessage({ type: 'ctool-open-new-tab', url: target, ack: true }, '*');
+          if (newTabAckTimer) clearTimeout(newTabAckTimer);
+          newTabAckTimer = setTimeout(() => {
+            newTabAckTimer = null;
+            openLinkFallback(target);
+          }, 1200);
+          return;
+        } catch (_) {
+          // 宿主消息不可用时直接走页面内兜底。
+        }
+      }
+      openLinkFallback(target);
+    }
+
+    /* 自动下载优先交给宿主页面上下文（页面图标 / 右键菜单传参场景），
+       避免 iframe 被跨域导航替换，也让 Gopeed 等下载器能接管页面里的 a[download]。
+       宿主未响应 ack 时回退为工具页内点击。 */
+    function requestDownload(url, filename) {
+      if (downloadAckTimer) clearTimeout(downloadAckTimer);
+      if (window.parent && window.parent !== window) {
+        try {
+          window.parent.postMessage({
+            type: 'ctool-direct-download',
+            url: url,
+            filename: filename || '',
+            ack: true
+          }, '*');
+          downloadAckTimer = setTimeout(() => {
+            downloadAckTimer = null;
+            deliver(url, filename);
+          }, 1500);
+          return;
+        } catch (_) {
+          // postMessage 不可用时退回本地交付。
+        }
+      }
+      deliver(url, filename);
+    }
+
+    function onHostMessage(event) {
+      const data = event.data;
+      if (!data || typeof data !== 'object') return;
+      if (event.source !== window.parent) return;
+      if (data.type === 'ctool-direct-download-ack' && downloadAckTimer) {
+        clearTimeout(downloadAckTimer);
+        downloadAckTimer = null;
+      }
+      if (data.type === 'ctool-open-new-tab-ack' && newTabAckTimer) {
+        clearTimeout(newTabAckTimer);
+        newTabAckTimer = null;
+      }
+    }
+
+    function allLinksText() {
+      return state.links.map((link) => link.url).join('\\n');
+    }
+
+    async function runProbe() {
+      if (state.busy) return;
+      const nodes = enabledNodes();
+      if (!nodes.length) {
+        setStatus(status, T.t('没有启用的镜像节点，请先在「镜像节点」中启用'), 'warn');
+        return;
+      }
+      const target = state.parsed.length ? state.parsed[0].target : SAMPLE_URL;
+      state.busy = true;
+      const probeButton = root.querySelector('[data-act="probe"]');
+      if (probeButton) {
+        probeButton.disabled = true;
+        probeButton.textContent = T.t('测速中…');
+      }
+      setStatus(status, T.t('正在测速 ' + nodes.length + ' 个节点…'), 'info');
+
+      try {
+        for (let i = 0; i < nodes.length; i += PROBE_CONCURRENCY) {
+          if (state.disposed) return;
+          const batch = nodes.slice(i, i + PROBE_CONCURRENCY);
+          const outcomes = await Promise.all(batch.map((node) => probeNode(node.url, target)));
+          outcomes.forEach((result, index) => {
+            state.probe[batch[index].url] = {
+              ok: !!result.ok,
+              ms: result.ms,
+              status: result.status,
+              opaque: !!result.opaque,
+              at: Date.now()
+            };
+          });
+          setStatus(status, T.t('已测速 ' + Math.min(i + PROBE_CONCURRENCY, nodes.length) + ' / ' + nodes.length + ' 个节点'), 'info');
+          refreshLinksOnly();
+        }
+        setPref(PROBE_KEY, state.probe);
+        const okCount = nodes.filter((node) => probeFresh(state.probe[node.url])).length;
+        setStatus(status, T.t('✓ 测速完成，' + okCount + ' / ' + nodes.length + ' 个节点可用'), 'ok');
+        showToast(T.t('测速完成，已按延迟排序'));
+      } finally {
+        state.busy = false;
+        if (probeButton) {
+          probeButton.disabled = false;
+          probeButton.textContent = T.t('测速并选最快');
+        }
+      }
+    }
+
+    async function fillFromPage() {
+      const pageUrl = await getSourcePageUrl();
+      if (!pageUrl || !/github\\.com|githubusercontent\\.com/i.test(pageUrl)) {
+        setStatus(status, T.t('当前页面不是 GitHub 链接，请手动粘贴'), 'warn');
+        return;
+      }
+      input.value = pageUrl;
+      generate();
+      tabs.activate('results');
+      setStatus(status, T.t('✓ 已载入当前页面链接'), 'ok');
+    }
+
+    function applyScannedLinks(links) {
+      const list = (Array.isArray(links) ? links : [])
+        .filter((url) => typeof url === 'string' && url && parseGithubLink(url).ok)
+        .slice(0, MAX_URLS);
+      if (!list.length) {
+        setStatus(status, T.t('本页没有识别到可加速的 GitHub 链接'), 'warn');
+        return;
+      }
+      input.value = list.join('\\n');
+      generate();
+      tabs.activate('results');
+      setStatus(status, T.t('✓ 已载入本页 ' + list.length + ' 个链接'), 'ok');
+    }
+
+    function onScanResult(event) {
+      applyScannedLinks(event && event.detail);
+    }
+
+    async function scanFromPage() {
+      setStatus(status, T.t('正在扫描当前页面…'), 'info');
+      try {
+        if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+          const response = await chrome.runtime.sendMessage({ type: 'ctool-scan-github-links' });
+          if (!state.disposed && response && response.ok && Array.isArray(response.links)) {
+            applyScannedLinks(response.links);
+            return;
+          }
+        }
+      } catch (_) {
+        // 非扩展环境或来源标签页不可用时继续走父窗口通道。
+      }
+      if (window.parent && window.parent !== window) {
+        try {
+          window.parent.postMessage({ type: 'ctool-scan-request' }, '*');
+          return;
+        } catch (_) {
+          // 继续落到失败提示。
+        }
+      }
+      if (!state.disposed) {
+        setStatus(status, T.t('未能读取当前页面，请在 GitHub 页面点击链接旁的图标'), 'warn');
+      }
+    }
+
+    function initBadgeToggle() {
+      if (!badgeToggle) return;
+      badgeToggle.checked = getPref(BADGE_PREF_KEY, true) !== false;
+      /* 扩展版内容脚本读的是 chrome.storage.local，以它为准回填 */
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local && chrome.storage.local.get) {
+          Promise.resolve(chrome.storage.local.get(BADGE_STORAGE_KEY)).then((result) => {
+            if (!state.disposed && result && typeof result[BADGE_STORAGE_KEY] === 'boolean') {
+              badgeToggle.checked = result[BADGE_STORAGE_KEY];
+            }
+          }).catch(() => {});
+        }
+      } catch (_) {
+        // 存储不可用时沿用本机偏好。
+      }
+      badgeToggle.addEventListener('change', () => {
+        const value = !!badgeToggle.checked;
+        setPref(BADGE_PREF_KEY, value);
+        try {
+          if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local && chrome.storage.local.set) {
+            const payload = {};
+            payload[BADGE_STORAGE_KEY] = value;
+            chrome.storage.local.set(payload);
+          }
+        } catch (_) {
+          // 忽略存储错误。
+        }
+        /* 油猴版宿主不监听 storage，用消息即时同步开关 */
+        try {
+          window.parent.postMessage({ type: 'ctool-github-badges', enabled: value }, '*');
+        } catch (_) {
+          // 忽略消息失败。
+        }
+        setStatus(status, T.t(value ? '✓ 已开启页面加速图标' : '✓ 已关闭页面加速图标'), 'ok');
+      });
+    }
+
+    root.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-act]');
+      if (!button || button.tagName === 'INPUT') return;
+      const action = button.getAttribute('data-act');
+      const index = Number(button.getAttribute('data-i'));
+      const pi = Number(button.getAttribute('data-pi'));
+
+      switch (action) {
+        case 'sample':
+          input.value = EXAMPLE_URLS;
+          generate();
+          tabs.activate('results');
+          break;
+        case 'clear-input':
+          input.value = '';
+          generate();
+          break;
+        case 'from-page':
+          fillFromPage();
+          break;
+        case 'scan-page':
+          scanFromPage();
+          break;
+        case 'generate':
+          generate();
+          tabs.activate('results');
+          break;
+        case 'probe':
+          runProbe();
+          break;
+        case 'copy-all':
+          if (!state.links.length) {
+            setStatus(status, T.t('请先生成加速直链'), 'warn');
+            break;
+          }
+          copyText(allLinksText());
+          break;
+        case 'copy-fastest':
+        case 'download-fastest': {
+          if (!state.links.length) {
+            setStatus(status, T.t('请先生成加速直链'), 'warn');
+            break;
+          }
+          const first = state.links.find((link) => link.pi === 0) || state.links[0];
+          if (action === 'copy-fastest') copyText(first.url);
+          else requestDownload(first.url, first.filename);
+          break;
+        }
+        case 'copy-link':
+          if (state.links[index]) copyText(state.links[index].url);
+          break;
+        case 'open-link':
+          if (state.links[index]) openLink(state.links[index].url);
+          break;
+        case 'download-link':
+          if (state.links[index]) requestDownload(state.links[index].url, state.links[index].filename);
+          break;
+        case 'expand':
+          if (state.expanded.has(pi)) state.expanded.delete(pi);
+          else state.expanded.add(pi);
+          renderResults();
+          break;
+        case 'copy-derived':
+          if (state.derived && state.derived[index]) copyText(state.derived[index].url);
+          break;
+        case 'use-derived':
+          if (state.derived && state.derived[index]) {
+            input.value = state.derived[index].url;
+            generate();
+            tabs.activate('results');
+          }
+          break;
+        case 'copy-clone':
+          copyText($('#gh-clone-cmd', root).textContent);
+          break;
+        case 'copy-insteadof':
+          copyText($('#gh-insteadof-cmd', root).textContent);
+          break;
+        case 'add-node': {
+          const url = normalizeNodeUrl(newNode.value);
+          if (!url) {
+            setStatus(status, T.t('请输入有效的镜像地址（http/https）'), 'error');
+            break;
+          }
+          if (state.nodes.some((node) => node.url === url)) {
+            setStatus(status, T.t('该镜像节点已存在'), 'warn');
+            break;
+          }
+          state.nodes.push({ url: url, name: '', region: '自定义', custom: true, defaultOn: true, enabled: true });
+          saveNodes(state.nodes);
+          newNode.value = '';
+          generate();
+          setStatus(status, T.t('✓ 已添加自定义节点'), 'ok');
+          break;
+        }
+        case 'remove-node':
+          if (!state.nodes[index] || !state.nodes[index].custom) break;
+          state.nodes.splice(index, 1);
+          saveNodes(state.nodes);
+          generate();
+          setStatus(status, T.t('✓ 已删除自定义节点'), 'ok');
+          break;
+        case 'enable-all':
+          state.nodes.forEach((node) => { node.enabled = true; });
+          saveNodes(state.nodes);
+          generate();
+          setStatus(status, T.t('✓ 已启用全部节点'), 'ok');
+          break;
+        case 'reset-nodes':
+          state.nodes = BUILTIN_NODES.map((node) => Object.assign({}, node, {
+            custom: false,
+            enabled: !!node.defaultOn
+          }));
+          state.probe = {};
+          setPref(PROBE_KEY, {});
+          saveNodes(state.nodes);
+          generate();
+          setStatus(status, T.t('✓ 已恢复默认节点'), 'ok');
+          break;
+        default:
+          break;
+      }
+    });
+
+    root.addEventListener('change', (event) => {
+      const target = event.target;
+      if (!target) return;
+
+      if (target === newTabToggle || target === imageBoostToggle) {
+        setPref(NEW_TAB_PREF_KEY, !!(newTabToggle && newTabToggle.checked));
+        setPref(IMAGE_BOOST_PREF_KEY, !!(imageBoostToggle && imageBoostToggle.checked));
+        broadcastPageSettings();
+        setStatus(status, T.t('✓ 已保存页面设置'), 'ok');
+        return;
+      }
+      if (!target.getAttribute || target.getAttribute('data-act') !== 'toggle') return;
+      const index = Number(target.getAttribute('data-i'));
+      if (!state.nodes[index]) return;
+      state.nodes[index].enabled = !!target.checked;
+      saveNodes(state.nodes);
+      generate();
+      /* 下载代理首选节点可能变化，图片加速用的前缀也要同步给页面注入器 */
+      broadcastPageSettings();
+    });
+
+    input.addEventListener('input', debounce(generate, 260));
+    bindCtrlEnter(input, () => { generate(); tabs.activate('results'); });
+    newNode.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const add = root.querySelector('[data-act="add-node"]');
+        if (add) add.click();
+      }
+    });
+    initBadgeToggle();
+    initPageSettings();
+    /* 首屏即把「站内链接新标签页」与图片加速用的下载代理节点同步到宿主 / 内容脚本 */
+    broadcastPageSettings();
+    if (typeof window.addEventListener === 'function') {
+      window.addEventListener('message', onHostMessage);
+      window.addEventListener('ctool:github-scan-result', onScanResult);
+    }
+
+    /* 任务传参：页面图标 / 链接右键 / 批量 chip 会把链接放在 text 里（可多行） */
+    const seed = context.text || context.pageUrl || '';
+    if (seed.indexOf('\\n') !== -1) {
+      const lines = seed.split(/\\r?\\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => parseGithubLink(line).ok)
+        .map((line) => parseGithubLink(line).url)
+        .slice(0, MAX_URLS);
+      if (lines.length) {
+        input.value = lines.join('\\n');
+        setStatus(status, T.t('✓ 已载入链接'), 'ok');
+      }
+    } else if (seed && parseGithubLink(seed).ok) {
+      input.value = parseGithubLink(seed).url;
+      setStatus(status, T.t('✓ 已载入链接'), 'ok');
+    }
+    generate();
+    if (context.text || (context.pageUrl && /github\\.com|githubusercontent\\.com/i.test(context.pageUrl))) {
+      tabs.activate('results');
+    }
+
+    /* action=download / quick-download：生成后自动交付首选直链，无需再点一次 */
+    if (context.action === 'download' || context.action === 'quick-download') {
+      const first = state.links.find((link) => link.pi === 0) || state.links[0];
+      if (first) {
+        requestDownload(first.url, first.filename);
+        setStatus(status, T.t('✓ 已用首选节点发起下载'), 'ok');
+        if (context.action === 'quick-download') {
+          setTimeout(() => {
+            try {
+              window.parent.postMessage({ type: 'ctool-panel-close' }, '*');
+            } catch (_) {
+              // 独立标签页无需收起。
+            }
+          }, 900);
+        }
+      } else {
+        setStatus(status, T.t('没有可用的镜像直链，请检查节点设置'), 'warn');
+      }
+    }
+
+    /* 旧版 🌐 图标 / 右键「用镜像访问」遗留的 action=visit 任务：
+       不再做任何域名替换，只把原始链接在新标签页打开。 */
+    if (context.action === 'visit') {
+      const firstLine = String(context.text || '').split(/\\r?\\n/)[0].trim() || context.pageUrl || '';
+      const info = parseGithubLink(firstLine);
+      if (info.ok) {
+        openLink(info.url);
+        setStatus(status, T.t('✓ 已在新标签页打开原链接'), 'ok');
+      }
+    }
+
+    return function cleanup() {
+      state.disposed = true;
+      if (downloadAckTimer) clearTimeout(downloadAckTimer);
+      if (newTabAckTimer) clearTimeout(newTabAckTimer);
+      if (typeof window.removeEventListener === 'function') {
+        window.removeEventListener('message', onHostMessage);
+        window.removeEventListener('ctool:github-scan-result', onScanResult);
+      }
+    };
+  };
+})();
+
+
 /* ===== js/tools-workspace.js ===== */
 ;
 /* CTool - 工作台：收藏、职业推荐与一键工作流 */
@@ -29892,6 +33300,15 @@ console.log('CTool');
       keywordsEn: 'download image document table media video audio pdf zip scrape batch web resources'
     },
     {
+      id: 'github',
+      name: 'GitHub 加速',
+      icon: 'GH',
+      category: '网页下载',
+      description: 'GitHub 文件下载走实测可用的代理节点生成加速直链；所有结果与 GitHub 站内链接默认新标签页打开，网页访问加速已下线。',
+      keywords: 'github 加速 镜像 代理 下载 release raw blob codeload zip git clone 直链 测速 ghproxy ghfast 图片 图床 新标签页 站内链接 下载加速',
+      keywordsEn: 'github accelerate mirror proxy download release raw blob codeload zip git clone direct link speed test ghproxy ghfast image new tab internal links download acceleration'
+    },
+    {
       id: 'jsoncsv',
       name: 'JSON ↔ CSV',
       icon: '⇄',
@@ -29986,9 +33403,9 @@ console.log('CTool');
       name: 'AI 问答',
       icon: 'AI',
       category: 'AI 助手',
-      description: '使用 OpenAI 兼容接口进行问答，密钥仅保存在本机。',
-      keywords: 'ai 问答 chat gpt openai 模型 助手',
-      keywordsEn: 'ai chat gpt openai llm assistant model'
+      description: '内置 OpenCode Zen 免费模型，无需配置即可问答；也可切换自定义接口。',
+      keywords: 'ai 问答 chat zen opencode 免费 零配置 模型 助手 大模型',
+      keywordsEn: 'ai chat zen opencode free zero config llm assistant model'
     },
     {
       id: 'xml',
@@ -30137,7 +33554,8 @@ console.log('CTool');
       pageTitle: task.pageTitle || '',
       sourceTabId: task.sourceTabId
     });
-    showToast(task.text ? '已载入选中文本' : '已打开工具');
+    const fromPage = /^(page-badge|page-chip|link-context-menu)$/.test(task.source || '');
+    showToast(T.t(fromPage ? '已载入页面链接' : (task.text ? '已载入选中文本' : '已打开工具')));
   }
 
   async function applyPendingFromStorage() {
@@ -30380,15 +33798,6 @@ console.log('CTool');
 
     const close = $('#compact-close');
     if (close) close.addEventListener('click', closeCompactPanel);
-
-    if (IN_IFRAME) {
-      window.addEventListener('message', (event) => {
-        if (event.source !== window.parent) return;
-        const data = event.data;
-        if (!data || typeof data !== 'object') return;
-        if (data.type === 'ctool-apply-task') applyTask(data.task);
-      }, false);
-    }
   }
 
   function navItemHtml(tool, favorite) {
@@ -30707,6 +34116,24 @@ console.log('CTool');
         selectTool(id);
       }
     });
+
+    /* 页内小窗（mode=compact）与油猴 iframe 都通过父窗口投递任务，
+       因此不能在 bindCompactEvents 里绑定，否则油猴版收不到页面图标传参。 */
+    if (IN_IFRAME) {
+      window.addEventListener('message', (event) => {
+        if (event.source !== window.parent) return;
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === 'ctool-apply-task') applyTask(data.task);
+        if (data.type === 'ctool-scan-result' && Array.isArray(data.links)) {
+          try {
+            window.dispatchEvent(new CustomEvent('ctool:github-scan-result', { detail: data.links }));
+          } catch (_) {
+            // 事件派发失败时忽略，用户仍可手动粘贴。
+          }
+        }
+      }, false);
+    }
   }
 
   function bindStorage() {
@@ -30824,7 +34251,7 @@ console.log('CTool');
               'This tool needs Chrome extension APIs and is unavailable in the userscript build.' +
             '</div>' +
             '<div class="field-hint" data-no-i18n>' +
-              '其余 34 个工具均可正常使用；如需网页资源批量下载，请安装完整版 Chrome / Edge 扩展。' +
+              '其余 35 个工具均可正常使用；如需网页资源批量下载，请安装完整版 Chrome / Edge 扩展。' +
             '</div>' +
           '</div>' +
         '</section>' +
@@ -30836,12 +34263,77 @@ console.log('CTool');
 </html>`;
   const STORE_KEY = 'ctoolUserPrefs';
   const canGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+  const scanner = window.CToolPageGithub || null;
+  const aiXhr = new Map();
+  let pendingTask = null;
+  let frameReady = false;
 
   let prefs = {};
   if (canGM) {
     try { prefs = GM_getValue(STORE_KEY, {}) || {}; } catch (e) { prefs = {}; }
   }
   if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = {};
+
+  /* 网页访问加速已下线：不再保存 / 使用任何镜像域名；站内链接统一新标签页 */
+  const DEFAULT_IMAGE_NODE = 'https://gh-proxy.com';
+  let imageNode = imageNodeValue(prefStr('githubImageNode', ''));
+  let newTabLinks = prefBool('githubNewTabLinks', true);
+  let imageBoost = prefBool('githubImageBoost', false);
+
+  function prefStr(key, fallback) {
+    const v = prefs['ctool.' + key];
+    if (v == null) return fallback;
+    try {
+      const parsed = JSON.parse(v);
+      return typeof parsed === 'string' ? parsed : fallback;
+    } catch (e) { return typeof v === 'string' ? v : fallback; }
+  }
+
+  function imageNodeValue(value) {
+    const raw = String(value == null ? '' : value).trim();
+    return /^https?:\/\//i.test(raw) ? raw : DEFAULT_IMAGE_NODE;
+  }
+
+  /* 文件代理前缀拼接（图片资源使用） */
+  function mirror(rawUrl, node) {
+    const n = String(node || DEFAULT_IMAGE_NODE).replace(/\/+$/, '');
+    if (!rawUrl || !n) return '';
+    const sep = /[?=&]$/.test(n) ? '' : '/';
+    return n + sep + String(rawUrl).replace(/^\/+/, '');
+  }
+
+  /* 所有链接统一新标签页打开：原样打开 URL，不做域名替换，不改写当前页面。
+     由页面注入器（站内链接）与 iframe 工具页（ctool-open-new-tab）共同调用。 */
+  function openNewTabUrl(url) {
+    const target = String(url || '').split('#')[0];
+    if (!/^https?:\/\//i.test(target)) return false;
+    try {
+      if (typeof GM_openInTab === 'function') {
+        GM_openInTab(target, { active: true });
+        return true;
+      }
+    } catch (e) { /* 退回 window.open */ }
+    try {
+      window.open(target, '_blank', 'noopener,noreferrer');
+      return true;
+    } catch (ignored) {
+      return false;
+    }
+  }
+
+  function applyPageSettings(settings) {
+    if (!settings || typeof settings !== 'object') return;
+    newTabLinks = settings.newTabLinks !== false;
+    imageBoost = settings.imageBoost === true;
+    if (typeof settings.imageNode === 'string' && /^https?:\/\//i.test(settings.imageNode)) {
+      imageNode = settings.imageNode;
+    }
+    if (scanner) {
+      if (typeof scanner.setNewTabLinks === 'function') scanner.setNewTabLinks(newTabLinks);
+      if (typeof scanner.setImageBoost === 'function') scanner.setImageBoost(imageBoost);
+      if (typeof scanner.refresh === 'function') scanner.refresh();
+    }
+  }
 
   function buildHtml() {
     const seed = JSON.stringify(prefs)
@@ -30855,6 +34347,108 @@ console.log('CTool');
   function css(el, rules) {
     Object.keys(rules).forEach(function (k) { el.style[k] = rules[k]; });
     return el;
+  }
+
+  /* getPref 写入的键在桥里保留 'ctool.' 前缀，值经过 JSON.stringify */
+  function prefBool(key, fallback) {
+    const v = prefs['ctool.' + key];
+    if (v == null) return fallback;
+    try { return JSON.parse(v) !== false; } catch (e) { return v !== 'false'; }
+  }
+
+  function deliverTask() {
+    if (!pendingTask || !frameReady || !frame || !frame.contentWindow) return;
+    const task = pendingTask;
+    pendingTask = null;
+    try {
+      frame.contentWindow.postMessage({ type: 'ctool-apply-task', task: task }, '*');
+    } catch (e) {
+      pendingTask = task;
+    }
+  }
+
+  function clickDownload(url, filename) {
+    try {
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      /* 始终保留 download 与 _blank，避免当前页面被导航到镜像地址 */
+      anchor.download = filename || '';
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      setTimeout(function () { anchor.remove(); }, 1000);
+    } catch (e) {}
+  }
+
+  /* OpenCode Zen 匿名免费层需要稳定的会话标识，跨站点保存一次即可 */
+  function aiSession() {
+    let sid = prefStr('aiZenSession', '');
+    if (!sid) {
+      const random = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : String(Date.now()) + Math.random().toString(16).slice(2);
+      sid = 'ses_ctool' + String(random).replace(/-/g, '');
+      prefs['ctool.aiZenSession'] = JSON.stringify(sid);
+      if (canGM) { try { GM_setValue(STORE_KEY, prefs); } catch (e) {} }
+    }
+    return sid;
+  }
+
+  /* iframe 内的 AI 请求由宿主用 GM_xmlhttpRequest 发出，绕开页面 CORS */
+  function aiFetch(d, source) {
+    const reply = function (payload) {
+      const target = source || (frame && frame.contentWindow);
+      try {
+        target.postMessage(Object.assign({ type: 'ctool-ai-fetch-result', id: d.id }, payload), '*');
+      } catch (e) {}
+    };
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      reply({ ok: false, status: 0, statusText: '', text: '', error: 'GM_xmlhttpRequest unavailable' });
+      return;
+    }
+    const url = String(d.url || '');
+    if (!/^https:\/\//i.test(url) && !/^http:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?\//i.test(url)) {
+      reply({ ok: false, status: 0, statusText: '', text: '', error: 'Unsupported URL' });
+      return;
+    }
+    const headers = Object.assign({}, d.headers || {});
+    if (/^https:\/\/opencode\.ai\//i.test(url) && !headers.Authorization) {
+      const sid = aiSession();
+      headers['x-session-id'] = headers['x-session-id'] || sid;
+      headers['x-opencode-session'] = headers['x-opencode-session'] || sid;
+    }
+    try {
+      const handle = GM_xmlhttpRequest({
+        method: d.method || 'GET',
+        url: url,
+        headers: headers,
+        data: d.method === 'POST' ? (d.body || '{}') : undefined,
+        timeout: 90000,
+        onload: function (res) {
+          aiXhr.delete(d.id);
+          reply({
+            ok: res.status >= 200 && res.status < 300,
+            status: res.status,
+            statusText: res.statusText || '',
+            text: res.responseText || ''
+          });
+        },
+        onerror: function () {
+          aiXhr.delete(d.id);
+          reply({ ok: false, status: 0, statusText: '', text: '', error: 'Network error' });
+        },
+        ontimeout: function () {
+          aiXhr.delete(d.id);
+          reply({ ok: false, status: 0, statusText: '', text: '', error: 'Request timed out' });
+        },
+        onabort: function () { aiXhr.delete(d.id); }
+      });
+      if (handle && typeof handle.abort === 'function') aiXhr.set(d.id, handle);
+    } catch (e) {
+      reply({ ok: false, status: 0, statusText: '', text: '', error: String(e && e.message || e) });
+    }
   }
 
   function openTab() {
@@ -30890,6 +34484,8 @@ console.log('CTool');
       boxShadow: '0 24px 70px rgba(0,0,0,0.3)'
     });
     frame.addEventListener('load', function () {
+      frameReady = true;
+      deliverTask();
       setTimeout(function () {
         try {
           if (frame.contentWindow && frame.contentWindow.CTool &&
@@ -30935,11 +34531,13 @@ console.log('CTool');
     (document.body || document.documentElement).appendChild(overlay);
   }
 
-  function open() {
+  function open(task) {
+    if (task && typeof task === 'object') pendingTask = task;
     ensureUI();
     if (!built) { frame.srcdoc = buildHtml(); built = true; }
     overlay.style.display = 'block';
     launcher.style.transform = 'scale(0.92)';
+    deliverTask();
   }
   function close() {
     if (overlay) overlay.style.display = 'none';
@@ -30972,9 +34570,72 @@ console.log('CTool');
     const d = event.data;
     if (!d || typeof d !== 'object') return;
     if (d.type === 'ctool-panel-close') { close(); return; }
+    if (d.type === 'ctool-page-task' && d.task) {
+      /* 旧版 🌐 图标遗留的 visit 任务：只开新标签页，不做域名替换 */
+      if (d.task.action === 'visit' && typeof d.task.text === 'string' && d.task.text) {
+        openNewTabUrl(d.task.text);
+        return;
+      }
+      open(d.task);
+      return;
+    }
+    if (d.type === 'ctool-github-badges' && scanner) { scanner.setEnabled(d.enabled !== false); return; }
+    if (d.type === 'ctool-github-visit-settings') { applyPageSettings(d); return; }
+    /* 工具页「打开」、页面注入器站内链接、旧版访问消息统一新标签页 */
+    if (d.type === 'ctool-open-new-tab' && typeof d.url === 'string' && d.url) {
+      openNewTabUrl(d.url);
+      if (d.ack) {
+        try { event.source.postMessage({ type: 'ctool-open-new-tab-ack' }, '*'); } catch (e) {}
+      }
+      return;
+    }
+    if (d.type === 'ctool-open-visit' && typeof d.url === 'string' && d.url) {
+      openNewTabUrl(d.url);
+      return;
+    }
+    /* 「加速访问此页面」已屏蔽：ctool-visit-current-page 不再响应 */
+    if (d.type === 'ctool-visit-scan-request' && frame && frame.contentWindow) {
+      try {
+        frame.contentWindow.postMessage({ type: 'ctool-visit-scan-result', links: [] }, '*');
+      } catch (e) {}
+      return;
+    }
+    if (d.type === 'ctool-scan-request' && frame && frame.contentWindow) {
+      try {
+        frame.contentWindow.postMessage({
+          type: 'ctool-scan-result',
+          links: scanner ? scanner.collect(false) : []
+        }, '*');
+      } catch (e) {}
+      return;
+    }
+    if (d.type === 'ctool-direct-download' && typeof d.url === 'string' && d.url) {
+      clickDownload(d.url, d.filename || '');
+      if (d.ack) {
+        try { event.source.postMessage({ type: 'ctool-direct-download-ack' }, '*'); } catch (e) {}
+      }
+      return;
+    }
+    if (d.type === 'ctool-ai-fetch') { aiFetch(d, event.source); return; }
+    if (d.type === 'ctool-ai-abort') {
+      const handle = aiXhr.get(d.id);
+      if (handle) {
+        try { handle.abort(); } catch (e) {}
+        aiXhr.delete(d.id);
+      }
+      return;
+    }
     if (d.__ctoolPrefs === 'set' && d.data && typeof d.data === 'object') {
       prefs = d.data;
       if (canGM) { try { GM_setValue(STORE_KEY, prefs); } catch (e) {} }
+      if (scanner) {
+        scanner.setEnabled(prefBool('githubPageBadges', true));
+        applyPageSettings({
+          newTabLinks: prefBool('githubNewTabLinks', true),
+          imageBoost: prefBool('githubImageBoost', false),
+          imageNode: prefStr('githubImageNode', '') || imageNode
+        });
+      }
     }
   });
 
@@ -30986,6 +34647,20 @@ console.log('CTool');
   }, true);
 
   installLauncher();
+  if (scanner && typeof scanner.install === 'function') {
+    scanner.install({
+      getEnabled: function () { return prefBool('githubPageBadges', true); },
+      getNewTabLinks: function () { return newTabLinks; },
+      getImageBoost: function () { return imageBoost; },
+      getImageNode: function () { return imageNode; },
+      /* 兼容旧注入器：镜像域名恒为空 */
+      getVisitMirror: function () { return ''; },
+      /* 站内链接点击只负责新开标签页，不做任何域名替换 */
+      openNewTab: function (url) { return openNewTabUrl(url); },
+      visitUrl: function (url) { return openNewTabUrl(url); },
+      openTask: function (task) { open(task); }
+    });
+  }
   if (typeof GM_registerMenuCommand === 'function') {
     try { GM_registerMenuCommand('打开 / 关闭 CTool 工具箱 (v' + VERSION + ')', toggle); } catch (e) {}
   }

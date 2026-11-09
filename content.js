@@ -7,6 +7,14 @@
   const HOST_ID = 'ctool-floating-host';
   const FRAME_URL = chrome.runtime.getURL('toolbox.html?mode=compact');
 
+  /* js/page-github.js 由 manifest 先加载：GitHub 页面链接识别与图标注入 */
+  const githubScanner = window.CToolPageGithub || null;
+  let githubBadgesEnabled = true;
+  let githubNewTabLinks = true;
+  let githubImageBoost = false;
+  /* 图片资源仍用下载代理前缀；网页访问加速（域名替换）已下线 */
+  let githubImageNode = 'https://gh-proxy.com';
+
   if (window.__CTOOL_FLOATING_ACTIVE__) return;
   window.__CTOOL_FLOATING_ACTIVE__ = true;
 
@@ -211,6 +219,9 @@
     }
   }
 
+  /* 页面注入器 / 右键菜单统一通过这个函数把任务送进小窗 */
+  window.__ctoolOpenTask = showPanel;
+
   function hidePanel() {
     panel.hidden = true;
     launcher.classList.remove('is-open');
@@ -235,6 +246,136 @@
     deliverTask();
   });
 
+  /* 直链交付放回页面上下文，避免 iframe 被跨域导航替换，也便于下载器接管 */
+  function clickDownload(url, filename) {
+    try {
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      /* 始终保留 download 与 _blank，避免浏览器把当前页面导航到镜像地址 */
+      anchor.download = filename || '';
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      setTimeout(() => anchor.remove(), 1000);
+    } catch (_) {
+      // 页面禁止创建下载锚点时忽略；工具页里仍保留可点击的直链。
+    }
+  }
+
+  /* 所有链接打开统一由后台新开标签页：不做任何域名替换，不改写当前页面。
+     后台不可用时退回页面内 window.open（同样只开新标签页）。 */
+  function openInNewTab(url) {
+    const target = String(url || '');
+    if (!/^https?:\/\//i.test(target)) return false;
+    const fallback = () => {
+      try { window.open(target, '_blank', 'noopener,noreferrer'); } catch (_) { /* 弹窗被拦截时保留原链接 */ }
+    };
+    try {
+      const sent = chrome.runtime.sendMessage({ type: 'ctool-open-new-tab', url: target }, (response) => {
+        if (chrome.runtime.lastError || !response || !response.ok) fallback();
+      });
+      if (sent && typeof sent.catch === 'function') sent.catch(fallback);
+      return true;
+    } catch (_) {
+      fallback();
+      return true;
+    }
+  }
+
+  function imageNodeValue(raw) {
+    const value = String(raw == null ? '' : raw).trim();
+    return /^https?:\/\//i.test(value) ? value : 'https://gh-proxy.com';
+  }
+
+  function initGithubScanner() {
+    if (!githubScanner || typeof githubScanner.install !== 'function') return;
+
+    const applyEnabled = function (value) {
+      githubBadgesEnabled = value !== false;
+      githubScanner.setEnabled(githubBadgesEnabled);
+    };
+    const applyNewTabLinks = function (value) {
+      githubNewTabLinks = value !== false;
+      if (typeof githubScanner.setNewTabLinks === 'function') githubScanner.setNewTabLinks(githubNewTabLinks);
+    };
+    const applyImageBoost = function (value) {
+      githubImageBoost = value === true;
+      if (typeof githubScanner.setImageBoost === 'function') githubScanner.setImageBoost(githubImageBoost);
+    };
+    const refreshScanner = function () {
+      if (typeof githubScanner.refresh === 'function') githubScanner.refresh();
+    };
+    const applySettings = function (result) {
+      if (!result) return;
+      if (typeof result.ctoolGithubBadges === 'boolean') applyEnabled(result.ctoolGithubBadges);
+      if (typeof result.ctoolGithubNewTabLinks === 'boolean') applyNewTabLinks(result.ctoolGithubNewTabLinks);
+      if (typeof result.ctoolGithubImageBoost === 'boolean') applyImageBoost(result.ctoolGithubImageBoost);
+      if (typeof result.ctoolGithubImageNode === 'string') {
+        githubImageNode = imageNodeValue(result.ctoolGithubImageNode);
+      }
+      refreshScanner();
+    };
+
+    try {
+      if (chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get([
+          'ctoolGithubBadges', 'ctoolGithubNewTabLinks',
+          'ctoolGithubImageBoost', 'ctoolGithubImageNode'
+        ]).then(applySettings).catch(() => {});
+        if (chrome.storage.onChanged) {
+          chrome.storage.onChanged.addListener((changes, area) => {
+            if (area !== 'local') return;
+            if (changes.ctoolGithubBadges) applyEnabled(changes.ctoolGithubBadges.newValue !== false);
+            if (changes.ctoolGithubNewTabLinks) applyNewTabLinks(changes.ctoolGithubNewTabLinks.newValue !== false);
+            if (changes.ctoolGithubImageBoost) applyImageBoost(changes.ctoolGithubImageBoost.newValue);
+            if (changes.ctoolGithubImageNode) {
+              githubImageNode = imageNodeValue(changes.ctoolGithubImageNode.newValue);
+              refreshScanner();
+            }
+          });
+        }
+      }
+    } catch (_) {
+      // 存储不可用时保持默认值。
+    }
+
+    githubScanner.install({
+      getEnabled: () => githubBadgesEnabled,
+      getNewTabLinks: () => githubNewTabLinks,
+      getImageBoost: () => githubImageBoost,
+      /* 兼容旧注入器：镜像域名恒为空 */
+      getVisitMirror: () => '',
+      getImageNode: () => githubImageNode,
+      /* 站内链接 / 工具页「打开」统一走后台新标签页 */
+      openNewTab: openInNewTab,
+      visitUrl: (url) => openInNewTab(url),
+      openTask: showPanel
+    });
+  }
+
+  initGithubScanner();
+
+  /* 注入器在无宿主回调时的兜底消息；iframe（工具页）的消息交给下面的监听器，
+     避免同一条 ctool-open-new-tab 被处理两次开出两个标签页。 */
+  window.addEventListener('message', (event) => {
+    if (event.source === frame.contentWindow) return;
+    const data = event.data;
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'ctool-page-task' && data.task) {
+      /* 旧版 🌐 图标遗留的 visit 任务：只开新标签页，不再做域名替换 */
+      if (data.task.action === 'visit' && typeof data.task.text === 'string' && data.task.text) {
+        openInNewTab(data.task.text);
+        return;
+      }
+      showPanel(data.task);
+    }
+    if (data.type === 'ctool-open-new-tab' && typeof data.url === 'string' && data.url) {
+      openInNewTab(data.url);
+    }
+  }, false);
+
   window.addEventListener('message', (event) => {
     if (event.source !== frame.contentWindow) return;
     const data = event.data;
@@ -245,6 +386,34 @@
         launcher.focus();
       } catch (_) {
         // 忽略聚焦失败。
+      }
+    }
+    if (data.type === 'ctool-direct-download' && typeof data.url === 'string' && data.url) {
+      clickDownload(data.url, data.filename || '');
+      if (data.ack) {
+        try {
+          event.source.postMessage({ type: 'ctool-direct-download-ack' }, '*');
+        } catch (_) {
+          // 忽略回执失败，工具页会在超时后自行交付。
+        }
+      }
+    }
+    /* 工具页 / 页面注入器 / 旧版消息统一走新标签页；不做任何域名替换 */
+    if (data.type === 'ctool-open-new-tab' && typeof data.url === 'string' && data.url) {
+      openInNewTab(data.url);
+      if (data.ack) {
+        try { event.source.postMessage({ type: 'ctool-open-new-tab-ack' }, '*'); } catch (_) { /* 忽略回执失败 */ }
+      }
+    }
+    if (data.type === 'ctool-open-visit' && typeof data.url === 'string' && data.url) {
+      openInNewTab(data.url);
+    }
+    /* 「加速访问此页面」已屏蔽：ctool-visit-current-page 不再响应 */
+    if (data.type === 'ctool-visit-scan-request') {
+      try {
+        event.source.postMessage({ type: 'ctool-visit-scan-result', links: [] }, '*');
+      } catch (_) {
+        // 忽略回传失败。
       }
     }
   }, false);
@@ -266,6 +435,15 @@
 
     if (message.type === 'ctool-panel-state') {
       sendResponse({ ok: true, open: !panel.hidden, loaded: frameLoaded });
+      return false;
+    }
+
+    if (message.type === 'ctool-scan-github-links') {
+      /* 只扫描可下载链接；网页访问链接扫描已随访问加速一起下线 */
+      const links = githubScanner && typeof githubScanner.collect === 'function'
+        ? githubScanner.collect(false)
+        : [];
+      sendResponse({ ok: true, links: links, pageUrl: location.href, pageTitle: document.title || '' });
       return false;
     }
 

@@ -2372,16 +2372,77 @@ console.log('CTool');
   };
 
   /* ==========================================================================
-     AI 问答（唯一需要联网的工具）
+     AI 问答：默认内置 OpenCode Zen（零配置），也可切换自定义 OpenAI 兼容接口
      ========================================================================== */
 
   const AI_CONFIG_KEY = 'aiConfig';
-  const AI_DEFAULT_PROMPT = '你是一个严谨、简洁的助手。';
+  const ZEN_BASE_URL = 'https://opencode.ai/zen/v1';
+  const ZEN_MODELS_KEY = 'aiZenModels';
+  const ZEN_SESSION_KEY = 'aiZenSession';
+  /* 公共备用端点：Zen 匿名层被限流 / 客户端校验拦下时自动切换，同样无需 API Key */
+  const AI_FALLBACK_ENDPOINT = 'https://text.pollinations.ai/openai';
+  const AI_FALLBACK_MODEL = 'openai';
+  const AI_DEFAULT_PROMPT = '你是一个严谨、简洁、友好的助手。请优先使用中文回答，代码与专业术语可保留英文。';
   const AI_QUICK_PROMPTS = ['总结选中文本', '翻译成英文', '润色文本', '解释代码'];
+  /* /models 不可用时的内置回退池：只收录 -free 免费模型，按中文表现排序 */
+  const ZEN_FALLBACK_MODELS = [
+    { id: 'glm-5.3-flash-free', name: 'GLM 5.3 Flash' },
+    { id: 'deepseek-v4.1-flash-free', name: 'DeepSeek V4.1 Flash' },
+    { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning' },
+    { id: 'mimo-v2.6-flash-free', name: 'MiMo V2.6 Flash' },
+    { id: 'flint-40b-free', name: 'Flint 40B' },
+    { id: 'iceman-free', name: 'Iceman' },
+    { id: 'inkling-2-small-free', name: 'Inkling 2 Small' }
+  ];
+
+  function aiRandomId() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+      if (window.crypto && window.crypto.getRandomValues) {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (_) { /* 回退到伪随机 */ }
+    return String(Date.now()) + Math.random().toString(16).slice(2);
+  }
+
+  /* 匿名免费层要求稳定的会话标识；由油猴 / 扩展后台桥在请求时补上同名头 */
+  function zenSession() {
+    let value = getPref(ZEN_SESSION_KEY, '');
+    if (typeof value !== 'string' || !value) {
+      value = 'ses_ctool' + aiRandomId().replace(/-/g, '');
+      setPref(ZEN_SESSION_KEY, value);
+    }
+    return value;
+  }
 
   function getAiConfig() {
-    const value = getPref(AI_CONFIG_KEY, {});
-    return value && typeof value === 'object' ? value : {};
+    const raw = getPref(AI_CONFIG_KEY, {});
+    const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const baseUrl = typeof value.baseUrl === 'string' ? value.baseUrl : '';
+    let provider = value.provider === 'custom' || value.provider === 'zen' ? value.provider : '';
+    /* 兼容旧配置：填过非 Zen 地址的用户自动落到自定义接口，不丢原有设置 */
+    if (!provider) provider = baseUrl && baseUrl.indexOf('opencode.ai/zen') === -1 ? 'custom' : 'zen';
+    const apiKey = typeof value.apiKey === 'string' ? value.apiKey : '';
+    return {
+      provider: provider,
+      baseUrl: baseUrl,
+      model: typeof value.model === 'string' ? value.model : '',
+      apiKey: apiKey,
+      zenKey: typeof value.zenKey === 'string' ? value.zenKey : (provider === 'zen' ? apiKey : ''),
+      zenModel: typeof value.zenModel === 'string' ? value.zenModel : '',
+      systemPrompt: typeof value.systemPrompt === 'string' ? value.systemPrompt : '',
+      temperature: typeof value.temperature === 'number' ? value.temperature : 0.7,
+      stream: value.stream !== false,
+      autoFallback: value.autoFallback !== false
+    };
+  }
+
+  function saveAiConfig(partial) {
+    const merged = Object.assign(getAiConfig(), partial || {});
+    setPref(AI_CONFIG_KEY, merged);
+    return merged;
   }
 
   function normalizeEndpoint(baseUrl) {
@@ -2392,9 +2453,134 @@ console.log('CTool');
     return value + '/v1/chat/completions';
   }
 
-  T.renderers.ai = function renderAi(root) {
+  function zenModelList() {
+    const cached = getPref(ZEN_MODELS_KEY, null);
+    if (Array.isArray(cached) && cached.length) {
+      const valid = cached
+        .filter((item) => item && typeof item.id === 'string' && /-free/i.test(item.id))
+        .map((item) => ({ id: item.id, name: String(item.name || item.id) }));
+      if (valid.length) return valid;
+    }
+    return ZEN_FALLBACK_MODELS.slice();
+  }
+
+  function zenModelRank(id) {
+    const index = ZEN_FALLBACK_MODELS.findIndex((item) => item.id === id);
+    return index === -1 ? 90 : index;
+  }
+
+  function modelQueue(preferred) {
+    const queue = [];
+    if (preferred) queue.push(preferred);
+    zenModelList().forEach((item) => {
+      if (queue.indexOf(item.id) === -1) queue.push(item.id);
+    });
+    return queue.slice(0, 6);
+  }
+
+  function makeResponse(data) {
+    const text = typeof data.text === 'string' ? data.text : '';
+    return {
+      ok: data.ok === true,
+      status: Number(data.status) || 0,
+      statusText: String(data.statusText || ''),
+      body: null,
+      text: function () { return Promise.resolve(text); },
+      json: function () { return Promise.resolve(JSON.parse(text || '{}')); }
+    };
+  }
+
+  /* 油猴版由宿主用 GM_xmlhttpRequest 发请求，绕开 iframe 的 CORS */
+  function aiRequest(url, options) {
+    if (typeof T.aiFetch === 'function') return T.aiFetch(url, options);
+    return fetch(url, options);
+  }
+
+  /* 扩展后台兜底：页面 fetch 若被 CORS / CSP 拦下，改由 service worker 发请求 */
+  function extensionRequest(url, headers, body) {
+    const payload = { type: 'ctool-ai-fetch', url: url, headers: headers, body: body };
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (data) => {
+        if (settled) return;
+        settled = true;
+        if (!data || typeof data.ok !== 'boolean') reject(new Error('后台未返回响应'));
+        else resolve(makeResponse(data));
+      };
+      try {
+        const result = chrome.runtime.sendMessage(payload, finish);
+        if (result && typeof result.then === 'function') {
+          result.then(finish).catch((error) => {
+            if (!settled) { settled = true; reject(error); }
+          });
+        }
+      } catch (error) {
+        if (!settled) { settled = true; reject(error); }
+      }
+    });
+  }
+
+  function hasExtensionBridge() {
+    return typeof T.aiFetch !== 'function' &&
+      typeof chrome !== 'undefined' && chrome.runtime &&
+      typeof chrome.runtime.sendMessage === 'function' &&
+      typeof chrome.runtime.id === 'string' && chrome.runtime.id !== 'ctool-userjs';
+  }
+
+  function parseAiError(raw, status, statusText) {
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) { data = null; }
+    const error = data && data.error ? data.error : null;
+    const detail = error ? (error.message || error.code || error.type) : (raw || statusText || 'HTTP ' + status);
+    return String(detail || 'HTTP ' + status).slice(0, 300);
+  }
+
+  function isRetryable(status, detail) {
+    return status === 0 || status === 401 || status === 403 || status === 404 ||
+      status === 408 || status === 429 || status >= 500 ||
+      /FreeUsageLimit|RegionError|RateLimit|MissingSession|quota|rate limit|overloaded|temporarily/i.test(detail || '');
+  }
+
+  function aiFriendlyError(detail, isZen, hasKey, fallbackTried) {
+    const head = T.t('请求失败：') + detail;
+    if (!isZen || hasKey) return head;
+    let text = head + '\n\n' + T.t('OpenCode Zen 免费模型当前不可用。可稍后重试，或在高级设置中填入自己的 Zen API Key，也可以切换到自定义接口。');
+    if (fallbackTried) text += '\n' + T.t('公共备用端点也未能响应，请稍后重试。');
+    return text;
+  }
+
+  async function refreshZenModels() {
+    const response = await aiRequest(ZEN_BASE_URL + '/models', { method: 'GET' });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const text = await response.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) { data = null; }
+    const list = (data && Array.isArray(data.data) ? data.data : [])
+      .filter((item) => item && typeof item.id === 'string' && /-free/i.test(item.id))
+      .map((item) => ({ id: item.id, name: String(item.name || item.id) }))
+      .sort((a, b) => zenModelRank(a.id) - zenModelRank(b.id));
+    if (!list.length) throw new Error(T.t('暂无可用的免费模型'));
+    setPref(ZEN_MODELS_KEY, list);
+    return list;
+  }
+
+  T.aiZen = {
+    baseUrl: ZEN_BASE_URL,
+    fallbackModels: ZEN_FALLBACK_MODELS,
+    normalizeEndpoint: normalizeEndpoint,
+    zenModelList: zenModelList,
+    modelQueue: modelQueue,
+    parseAiError: parseAiError,
+    isRetryable: isRetryable,
+    refreshZenModels: refreshZenModels,
+    session: zenSession,
+    getConfig: getAiConfig
+  };
+
+  T.renderers.ai = function renderAi(root, context) {
     const config = getAiConfig();
     const messages = [];
+    const bridgeMode = typeof T.aiFetch === 'function';
 
     root.innerHTML = `
       <div class="ai-layout">
@@ -2404,39 +2590,78 @@ console.log('CTool');
             <div class="card-actions"><span class="badge badge-warn">联网</span></div>
           </div>
           <div class="card-body">
-            <label class="field">
-              <span class="field-label">接口地址</span>
-              <input class="input" id="ai-base" type="url" spellcheck="false" placeholder="https://api.openai.com/v1" value="${escapeHtml(config.baseUrl || '')}">
-              <span class="field-hint">支持 OpenAI 兼容接口，例如 https://api.openai.com/v1 或本地服务。</span>
-            </label>
-            <div class="form-grid">
+            <div class="ai-provider-switch" id="ai-provider">
+              <button class="ai-provider-btn" type="button" data-provider="zen">
+                <strong>OpenCode Zen</strong><small>零配置 · 免费模型</small>
+              </button>
+              <button class="ai-provider-btn" type="button" data-provider="custom">
+                <strong>自定义接口</strong><small>OpenAI 兼容 / 本地模型</small>
+              </button>
+            </div>
+
+            <div class="ai-zen-panel" id="ai-zen-panel">
+              <div class="ai-zen-note">已内置 OpenCode Zen 免费模型，打开即可提问，无需接口地址或 API Key。免费模型池会轮换，请求失败时自动切换其他模型。</div>
               <label class="field">
-                <span class="field-label">模型</span>
-                <input class="input" id="ai-model" type="text" spellcheck="false" placeholder="gpt-4o-mini" value="${escapeHtml(config.model || '')}">
-              </label>
-              <label class="field">
-                <span class="field-label">API Key</span>
-                <input class="input" id="ai-key" type="password" autocomplete="off" placeholder="sk-…" value="${escapeHtml(config.apiKey || '')}">
+                <span class="field-label">免费模型</span>
+                <div class="ai-zen-row">
+                  <select class="select" id="ai-zen-model" aria-label="免费模型"></select>
+                  <button class="btn btn-sm" type="button" id="ai-zen-refresh">刷新模型</button>
+                </div>
+                <span class="field-hint">列表来自 Zen 的 /models 接口，点「刷新模型」获取最新免费池。</span>
               </label>
             </div>
-            <label class="field">
-              <span class="field-label">系统提示词</span>
-              <textarea class="textarea" id="ai-system" placeholder="你是一个严谨、简洁的助手。">${escapeHtml(config.systemPrompt || '')}</textarea>
-            </label>
-            <div class="form-grid">
+
+            <div class="ai-custom-panel" id="ai-custom-panel" hidden>
               <label class="field">
-                <span class="field-label">温度</span>
-                <input class="input" id="ai-temperature" type="number" min="0" max="2" step="0.1" value="${escapeHtml(String(config.temperature == null ? 0.7 : config.temperature))}">
+                <span class="field-label">接口地址</span>
+                <input class="input" id="ai-base" type="url" spellcheck="false" placeholder="https://api.openai.com/v1" value="${escapeHtml(config.baseUrl)}">
+                <span class="field-hint">支持 OpenAI 兼容接口，例如 https://api.openai.com/v1 或本地 Ollama 服务。</span>
               </label>
-              <label class="option with-desc">
-                <input type="checkbox" id="ai-stream"${config.stream === false ? '' : ' checked'}>
-                <span>流式输出<small>逐字显示回答，适合长文本</small></span>
-              </label>
+              <div class="form-grid">
+                <label class="field">
+                  <span class="field-label">模型</span>
+                  <input class="input" id="ai-model" type="text" spellcheck="false" placeholder="gpt-4o-mini" value="${escapeHtml(config.model)}">
+                </label>
+                <label class="field">
+                  <span class="field-label">API Key</span>
+                  <input class="input" id="ai-key" type="password" autocomplete="off" placeholder="sk-…" value="${escapeHtml(config.apiKey)}">
+                </label>
+              </div>
             </div>
-            <div class="ai-key-note">API Key 仅保存在本机 localStorage，不会同步或上传到其他服务；本地服务（如 Ollama）可留空。</div>
+
+            <details class="ai-advanced" id="ai-advanced">
+              <summary>高级设置</summary>
+              <div class="ai-advanced-body">
+                <label class="field">
+                  <span class="field-label">Zen API Key（可选）</span>
+                  <input class="input" id="ai-zen-key" type="password" autocomplete="off" placeholder="留空即匿名免费使用" value="${escapeHtml(config.zenKey)}">
+                  <span class="field-hint">匿名免费额度不可用时，可填入自己的 OpenCode Zen Key 提升稳定性。</span>
+                </label>
+                <label class="field">
+                  <span class="field-label">系统提示词</span>
+                  <textarea class="textarea" id="ai-system" placeholder="你是一个严谨、简洁的助手。">${escapeHtml(config.systemPrompt)}</textarea>
+                </label>
+                <div class="form-grid">
+                  <label class="field">
+                    <span class="field-label">温度</span>
+                    <input class="input" id="ai-temperature" type="number" min="0" max="2" step="0.1" value="${escapeHtml(String(config.temperature))}">
+                  </label>
+                  <label class="option with-desc">
+                    <input type="checkbox" id="ai-stream"${config.stream === false ? '' : ' checked'}>
+                    <span>流式输出<small>${escapeHtml(bridgeMode ? '油猴脚本版使用完整响应' : '逐字显示回答，适合长文本')}</small></span>
+                  </label>
+                </div>
+                <label class="option with-desc">
+                  <input type="checkbox" id="ai-auto-fallback"${config.autoFallback === false ? '' : ' checked'}>
+                  <span>Zen 不可用时自动使用公共备用端点<small>内置 Pollinations 公共端点，同样无需 API Key；提示词会发送给第三方服务。</small></span>
+                </label>
+              </div>
+            </details>
+
+            <div class="ai-key-note">设置会自动保存在本机 localStorage，无需点击保存；API Key 不会同步或上传到其他服务。</div>
             <div class="row-between">
-              <button class="btn btn-primary" type="button" id="ai-save">保存设置</button>
               <span class="status" id="ai-settings-status"></span>
+              <span class="field-hint">修改后立即生效</span>
             </div>
           </div>
         </section>
@@ -2445,15 +2670,15 @@ console.log('CTool');
           <div class="card-head">
             <div class="card-heading"><span class="card-icon">CHAT</span><h2>AI 问答</h2></div>
             <div class="card-actions">
-              <span class="badge" id="ai-state">未配置</span>
+              <span class="badge" id="ai-state">零配置 · 就绪</span>
               <button class="btn btn-sm" type="button" id="ai-clear">清除对话</button>
             </div>
           </div>
           <div class="card-body">
             <div class="ai-chat-log" id="ai-log">
               <div class="ai-empty" id="ai-empty">
-                <strong>${T.t('使用 OpenAI 兼容接口进行问答')}</strong>
-                <span>${T.t('先在左侧保存接口地址、模型和 API Key，然后在下方提问。')}</span>
+                <strong>${T.t('直接输入问题，无需任何配置')}</strong>
+                <span>${T.t('默认使用 OpenCode Zen 免费模型；也可以切换到自己的接口。')}</span>
               </div>
             </div>
             <div class="ai-composer">
@@ -2466,7 +2691,7 @@ console.log('CTool');
               </div>
             </div>
             <div class="ai-disclosure">
-              AI 问答会把你的问题和 API Key 发送到你配置的服务，其他工具仍然完全离线。
+              AI 问答会把你的问题发送到 OpenCode Zen（或你配置的服务）；Zen 不可用时会自动回退到 Pollinations 公共端点，均可在高级设置中关闭。免费模型的提示词可能用于改进模型，请勿提交个人或机密信息；其余工具仍然完全离线。
             </div>
             <div class="status" id="ai-status"></div>
           </div>
@@ -2474,12 +2699,19 @@ console.log('CTool');
       </div>
     `;
 
+    const providerBox = $('#ai-provider', root);
+    const zenPanel = $('#ai-zen-panel', root);
+    const customPanel = $('#ai-custom-panel', root);
+    const zenModelSelect = $('#ai-zen-model', root);
+    const zenRefreshButton = $('#ai-zen-refresh', root);
+    const zenKeyInput = $('#ai-zen-key', root);
     const baseInput = $('#ai-base', root);
     const modelInput = $('#ai-model', root);
     const keyInput = $('#ai-key', root);
     const systemInput = $('#ai-system', root);
     const temperatureInput = $('#ai-temperature', root);
     const streamInput = $('#ai-stream', root);
+    const autoFallbackInput = $('#ai-auto-fallback', root);
     const settingsStatus = $('#ai-settings-status', root);
     const log = $('#ai-log', root);
     const empty = $('#ai-empty', root);
@@ -2488,23 +2720,53 @@ console.log('CTool');
     const stateBadge = $('#ai-state', root);
     const status = $('#ai-status', root);
     let sending = false;
+    let provider = config.provider;
 
     function currentConfig() {
       return {
+        provider: provider,
         baseUrl: baseInput.value.trim(),
         model: modelInput.value.trim(),
         apiKey: keyInput.value.trim(),
+        zenKey: zenKeyInput.value.trim(),
+        zenModel: zenModelSelect.value,
         systemPrompt: systemInput.value.trim(),
         temperature: Math.max(0, Math.min(2, Number(temperatureInput.value) || 0)),
-        stream: !streamInput || streamInput.checked
+        stream: streamInput ? streamInput.checked : true,
+        autoFallback: autoFallbackInput ? autoFallbackInput.checked : true
       };
     }
 
+    function fillModelOptions() {
+      const list = zenModelList();
+      const previous = zenModelSelect.value;
+      zenModelSelect.innerHTML = list.map((item) =>
+        '<option value="' + escapeHtml(item.id) + '">' + escapeHtml(item.id + ' · ' + item.name) + '</option>'
+      ).join('');
+      if (previous && list.some((item) => item.id === previous)) zenModelSelect.value = previous;
+      else if (config.zenModel && list.some((item) => item.id === config.zenModel)) zenModelSelect.value = config.zenModel;
+    }
+
+    function persist(partial) {
+      saveAiConfig(partial);
+      refreshState();
+    }
+
     function refreshState() {
-      const value = currentConfig();
-      const ready = !!(value.baseUrl && value.model);
-      stateBadge.textContent = ready ? '已配置' : '未配置';
-      stateBadge.className = 'badge ' + (ready ? 'badge-ok' : 'badge-warn');
+      const cfg = currentConfig();
+      $$('.ai-provider-btn', providerBox).forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-provider') === provider);
+      });
+      zenPanel.hidden = provider !== 'zen';
+      customPanel.hidden = provider !== 'custom';
+      if (provider === 'zen') {
+        stateBadge.textContent = cfg.zenKey ? T.t('Zen Key · 就绪') : T.t('零配置 · 就绪');
+        stateBadge.className = 'badge badge-ok';
+      } else {
+        const ready = !!(cfg.baseUrl && cfg.model);
+        stateBadge.textContent = ready ? T.t('已配置') : T.t('未配置');
+        stateBadge.className = 'badge ' + (ready ? 'badge-ok' : 'badge-warn');
+      }
     }
 
     function scrollToBottom() {
@@ -2515,188 +2777,263 @@ console.log('CTool');
       if (empty) empty.hidden = true;
       const wrapper = document.createElement('div');
       wrapper.className = 'ai-message ai-' + role + (pending ? ' ai-pending' : '');
-      const label = role === 'user' ? '你' : '助手';
+      const label = role === 'user' ? T.t('你') : T.t('助手');
       wrapper.innerHTML = '<div class="ai-message-meta"><span>' + escapeHtml(label) + '</span>' +
-        (role === 'assistant' && !pending ? '<button class="copy-mini" type="button" data-ai-copy>复制回答</button>' : '') +
+        (role === 'assistant' && !pending ? '<button class="copy-mini" type="button" data-ai-copy>' + escapeHtml(T.t('复制回答')) + '</button>' : '') +
         '</div><div class="ai-message-body">' + escapeHtml(text) + '</div>';
       log.appendChild(wrapper);
       scrollToBottom();
       return wrapper;
     }
 
-    function updateBadges() {
-      refreshState();
+    function attachCopy(pending) {
+      pending.classList.remove('ai-pending');
+      const meta = pending.querySelector('.ai-message-meta');
+      if (meta && !meta.querySelector('[data-ai-copy]')) {
+        const button = document.createElement('button');
+        button.className = 'copy-mini';
+        button.type = 'button';
+        button.setAttribute('data-ai-copy', '');
+        button.textContent = T.t('复制回答');
+        meta.appendChild(button);
+      }
     }
 
-    function appendError(message) {
-      addMessage('assistant', message, false);
-      setStatus(status, message, 'error');
+    /* 单次请求：返回 { content, retryable, error }；流式内容实时写入 pending */
+    async function askOnce(options) {
+      const payload = {
+        model: options.model,
+        messages: options.payloadMessages,
+        temperature: options.temperature,
+        stream: options.useStream
+      };
+      const body = JSON.stringify(payload);
+      let response;
+      try {
+        response = await aiRequest(options.endpoint, {
+          method: 'POST',
+          headers: options.headers,
+          body: body,
+          signal: options.controller ? options.controller.signal : undefined
+        });
+      } catch (error) {
+        if (!hasExtensionBridge() || (error && error.name === 'AbortError')) throw error;
+        /* 页面直连被 CORS / CSP 拦截时，改走扩展后台桥（非流式） */
+        response = await extensionRequest(options.endpoint, options.headers, JSON.stringify(Object.assign({}, payload, { stream: false })));
+      }
+
+      if (!response.ok) {
+        const raw = await response.text();
+        const detail = parseAiError(raw, response.status, response.statusText);
+        return {
+          content: '',
+          retryable: isRetryable(response.status, detail),
+          error: new Error(detail)
+        };
+      }
+
+      const canStream = options.useStream && response.body && typeof response.body.getReader === 'function';
+      let content = '';
+
+      function renderDelta() {
+        options.pendingBody.textContent = content;
+        options.pending.classList.remove('ai-pending');
+        scrollToBottom();
+      }
+
+      if (canStream) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        let finished = false;
+        const handleLine = (line) => {
+          const trimmed = line.replace(/\r$/, '');
+          if (!trimmed || trimmed.charAt(0) === ':' || trimmed.indexOf('data:') !== 0) return;
+          const chunk = trimmed.slice(5).trim();
+          if (!chunk) return;
+          if (chunk === '[DONE]') { finished = true; return; }
+          let json = null;
+          try { json = JSON.parse(chunk); } catch (_) { return; }
+          const choice = json.choices && json.choices[0];
+          if (!choice) return;
+          const delta = choice.delta || choice.message || {};
+          const piece = delta.content != null ? delta.content : '';
+          if (piece) { content += piece; renderDelta(); }
+        };
+        while (!finished) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          let index;
+          while (!finished && (index = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, index);
+            buffer = buffer.slice(index + 1);
+            handleLine(line);
+          }
+        }
+        if (!finished && buffer.trim()) handleLine(buffer);
+      } else {
+        const raw = await response.text();
+        let data = null;
+        try { data = raw ? JSON.parse(raw) : null; } catch (_) { data = null; }
+        content = data && data.choices && data.choices[0] && data.choices[0].message
+          ? data.choices[0].message.content
+          : '';
+        /* 兼容只返回 SSE 文本但没有 response.body 的环境 */
+        if (!content && raw && raw.indexOf('data:') !== -1) {
+          const pieces = [];
+          raw.split('\n').forEach((line) => {
+            const trimmed = line.trim();
+            if (trimmed.indexOf('data:') !== 0) return;
+            const chunk = trimmed.slice(5).trim();
+            if (!chunk || chunk === '[DONE]') return;
+            try {
+              const json = JSON.parse(chunk);
+              const delta = json.choices && json.choices[0] && (json.choices[0].delta || json.choices[0].message);
+              if (delta && typeof delta.content === 'string') pieces.push(delta.content);
+            } catch (_) {}
+          });
+          content = pieces.join('');
+        }
+      }
+
+      if (!content) {
+        return { content: '', retryable: true, error: new Error(T.t('返回内容为空')) };
+      }
+      return { content: content, retryable: false, error: null };
     }
 
     async function send() {
       if (sending) return;
       const text = input.value.trim();
       if (!text) {
-        setStatus(status, '请先输入问题', 'warn');
+        setStatus(status, T.t('请先输入问题'), 'warn');
         input.focus();
         return;
       }
-      const configValue = currentConfig();
-      if (!configValue.baseUrl || !configValue.model) {
-        setStatus(status, '尚未配置 AI 接口，请先在设置中填写接口地址和模型。', 'warn');
-        appendError('尚未配置 AI 接口。请先在左侧填写接口地址和模型。');
+      const cfg = currentConfig();
+      const isZen = cfg.provider === 'zen';
+      const endpoint = isZen ? ZEN_BASE_URL + '/chat/completions' : normalizeEndpoint(cfg.baseUrl);
+      if (!isZen && (!cfg.baseUrl || !cfg.model)) {
+        setStatus(status, T.t('尚未配置 AI 接口，请先填写接口地址和模型。'), 'warn');
+        addMessage('assistant', T.t('尚未配置 AI 接口。请先在左侧填写接口地址和模型，或切回 OpenCode Zen 免配置使用。'), false);
         return;
       }
 
-      const endpoint = normalizeEndpoint(configValue.baseUrl);
-      const useStream = configValue.stream !== false;
+      /* 油猴版走 GM_xmlhttpRequest 桥，只能拿到完整响应，因此不启用流式 */
+      const useStream = cfg.stream !== false && !bridgeMode;
+      const headers = { 'Content-Type': 'application/json' };
+      const key = isZen ? cfg.zenKey : cfg.apiKey;
+      if (key) headers.Authorization = 'Bearer ' + key;
+      /* 匿名免费层：不发送 Authorization，避免被当作无效 Key 拒绝；会话头由桥补充 */
+
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 90000) : null;
       sending = true;
       sendButton.disabled = true;
       input.value = '';
       addMessage('user', text, false);
-      const pending = addMessage('assistant', '正在思考…', true);
+      const pending = addMessage('assistant', T.t('正在思考…'), true);
       const pendingBody = pending.querySelector('.ai-message-body');
       messages.push({ role: 'user', content: text });
-      setStatus(status, useStream ? '正在接收流式回答…' : '正在请求…', 'info');
 
+      const system = cfg.systemPrompt || AI_DEFAULT_PROMPT;
       const payloadMessages = [];
-      const system = configValue.systemPrompt || AI_DEFAULT_PROMPT;
       if (system) payloadMessages.push({ role: 'system', content: system });
       messages.forEach((message) => payloadMessages.push(message));
+      setStatus(status, useStream ? T.t('正在接收流式回答…') : T.t('正在请求…'), 'info');
 
-      const controller = typeof AbortController === 'function' ? new AbortController() : null;
-      const timer = controller ? setTimeout(() => controller.abort(), 90000) : null;
-      let content = '';
-
-      function attachCopy() {
-        pending.classList.remove('ai-pending');
-        const meta = pending.querySelector('.ai-message-meta');
-        if (meta && !meta.querySelector('[data-ai-copy]')) {
-          const button = document.createElement('button');
-          button.className = 'copy-mini';
-          button.type = 'button';
-          button.setAttribute('data-ai-copy', '');
-          button.textContent = '复制回答';
-          meta.appendChild(button);
-        }
-      }
-
-      function renderDelta() {
-        pendingBody.textContent = content;
-        pending.classList.remove('ai-pending');
-        scrollToBottom();
-      }
+      const zenIds = isZen ? modelQueue(cfg.zenModel).slice(0, 3) : [];
+      let candidates = isZen
+        ? zenIds.map((id) => ({ model: id, endpoint: endpoint, fallback: false }))
+        : [{ model: cfg.model, endpoint: endpoint, fallback: false }];
+      const useFallback = isZen && cfg.autoFallback !== false && !key;
+      let fallbackAdded = false;
+      let lastError = null;
+      let refreshed = false;
+      let done = false;
 
       try {
-        const headers = { 'Content-Type': 'application/json' };
-        if (configValue.apiKey) headers.Authorization = 'Bearer ' + configValue.apiKey;
-
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: headers,
-          body: JSON.stringify({
-            model: configValue.model,
-            messages: payloadMessages,
-            temperature: configValue.temperature,
-            stream: useStream
-          }),
-          signal: controller ? controller.signal : undefined
-        });
-
-        if (!response.ok) {
-          const raw = await response.text();
-          let data = null;
-          try {
-            data = raw ? JSON.parse(raw) : null;
-          } catch (_) {
-            data = null;
+        for (let i = 0; i < candidates.length && !done; i++) {
+          const candidate = candidates[i];
+          const model = candidate.model;
+          if (i > 0) {
+            const label = candidate.fallback
+              ? T.t('正在切换公共备用端点…')
+              : T.t('正在切换模型：') + model;
+            pendingBody.textContent = label;
+            setStatus(status, label, 'info');
           }
-          const detail = data && data.error && (data.error.message || data.error.code)
-            ? data.error.message || data.error.code
-            : (raw || response.statusText || 'HTTP ' + response.status);
-          throw new Error(String(detail).slice(0, 500));
-        }
+          let result;
+          try {
+            result = await askOnce({
+              endpoint: candidate.endpoint,
+              headers: headers,
+              model: model,
+              payloadMessages: payloadMessages,
+              temperature: cfg.temperature,
+              useStream: useStream,
+              controller: controller,
+              pending: pending,
+              pendingBody: pendingBody
+            });
+          } catch (error) {
+            result = {
+              content: '',
+              retryable: !(error && error.name === 'AbortError'),
+              error: error
+            };
+          }
 
-        const canStream = useStream && response.body && typeof response.body.getReader === 'function';
-        if (canStream) {
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder('utf-8');
-          let buffer = '';
-          let finished = false;
+          if (result.content) {
+            pendingBody.textContent = result.content;
+            attachCopy(pending);
+            messages.push({ role: 'assistant', content: result.content });
+            setStatus(status, T.t('✓ 回答完成') + ' · ' + model +
+              (candidate.fallback ? T.t('（公共备用端点）') : ''), 'ok');
+            scrollToBottom();
+            done = true;
+            break;
+          }
 
-          const handleLine = (line) => {
-            const trimmed = line.replace(/\r$/, '');
-            if (!trimmed || trimmed.charAt(0) === ':') return;
-            if (trimmed.indexOf('data:') !== 0) return;
-            const payload = trimmed.slice(5).trim();
-            if (!payload) return;
-            if (payload === '[DONE]') {
-              finished = true;
-              return;
-            }
-            let json = null;
+          lastError = result.error || new Error(T.t('请求失败'));
+          if (!isZen || !result.retryable) break;
+
+          /* Zen 连续失败时切换到免 Key 的公共备用端点，保证零配置仍可问答 */
+          if (useFallback && !fallbackAdded && !candidate.fallback &&
+              i >= Math.min(1, candidates.length - 1)) {
+            fallbackAdded = true;
+            candidates = candidates.slice(0, i + 1).concat([
+              { model: AI_FALLBACK_MODEL, endpoint: AI_FALLBACK_ENDPOINT, fallback: true }
+            ]);
+            continue;
+          }
+
+          /* 关闭自动回退时：内置队列耗尽就联网刷新一次免费模型池再试几个新模型 */
+          if (!useFallback && i === candidates.length - 1 && !refreshed) {
+            refreshed = true;
             try {
-              json = JSON.parse(payload);
-            } catch (_) {
-              return;
-            }
-            const choice = json.choices && json.choices[0];
-            if (!choice) return;
-            const delta = choice.delta || choice.message || {};
-            const piece = delta.content != null ? delta.content : '';
-            if (piece) {
-              content += piece;
-              renderDelta();
-            }
-          };
-
-          while (!finished) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            buffer += decoder.decode(chunk.value, { stream: true });
-            let index;
-            while (!finished && (index = buffer.indexOf('\n')) !== -1) {
-              const line = buffer.slice(0, index);
-              buffer = buffer.slice(index + 1);
-              handleLine(line);
-            }
+              const fresh = await refreshZenModels();
+              fillModelOptions();
+              const extra = fresh
+                .map((item) => item.id)
+                .filter((id) => zenIds.indexOf(id) === -1)
+                .slice(0, 3)
+                .map((id) => ({ model: id, endpoint: endpoint, fallback: false }));
+              candidates = candidates.concat(extra);
+            } catch (_) { /* 刷新失败就按现有错误提示 */ }
           }
-          if (!finished && buffer.trim()) handleLine(buffer);
-        } else {
-          const raw = await response.text();
-          let data = null;
-          try {
-            data = raw ? JSON.parse(raw) : null;
-          } catch (_) {
-            data = null;
-          }
-          content = data && data.choices && data.choices[0] && data.choices[0].message
-            ? data.choices[0].message.content
-            : '';
         }
 
-        if (!content) throw new Error('返回内容为空');
-
-        pendingBody.textContent = content;
-        attachCopy();
-        messages.push({ role: 'assistant', content: content });
-        setStatus(status, '✓ 回答完成', 'ok');
-        scrollToBottom();
-      } catch (error) {
-        if (content) {
-          pendingBody.textContent = content + '\n\n[回答中断]';
-          attachCopy();
-          messages.push({ role: 'assistant', content: content });
-          setStatus(status, '回答中断：' + (error && error.message ? error.message : '未知错误'), 'warn');
-          scrollToBottom();
-        } else {
+        if (!done) {
           pending.remove();
           messages.pop();
-          if (error && error.name === 'AbortError') {
-            appendError('请求超时');
-          } else {
-            appendError('请求失败：' + (error.message || '未知错误'));
-          }
+          const detail = lastError && lastError.name === 'AbortError'
+            ? T.t('请求超时')
+            : (lastError && lastError.message ? lastError.message : T.t('请求失败'));
+          const message = aiFriendlyError(detail, isZen, !!key, fallbackAdded);
+          addMessage('assistant', message, false);
+          setStatus(status, message, 'error');
         }
       } finally {
         if (timer) clearTimeout(timer);
@@ -2714,13 +3051,38 @@ console.log('CTool');
       if (body) copyText(body.textContent);
     });
 
-    $('#ai-save', root).addEventListener('click', () => {
-      const value = currentConfig();
-      setPref(AI_CONFIG_KEY, value);
-      setStatus(settingsStatus, '✓ 已保存', 'ok');
-      refreshState();
-      showToast('已保存');
+    providerBox.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-provider]');
+      if (!button) return;
+      provider = button.getAttribute('data-provider') === 'custom' ? 'custom' : 'zen';
+      persist({ provider: provider });
+      setStatus(settingsStatus, '', '');
     });
+
+    zenRefreshButton.addEventListener('click', async () => {
+      zenRefreshButton.disabled = true;
+      setStatus(settingsStatus, T.t('正在获取模型列表…'), 'info');
+      try {
+        const list = await refreshZenModels();
+        fillModelOptions();
+        setStatus(settingsStatus, T.t('✓ 已更新 {count} 个免费模型', { count: list.length }), 'ok');
+      } catch (error) {
+        setStatus(settingsStatus, T.t('获取失败：') + (error && error.message ? error.message : T.t('未知错误')), 'warn');
+      } finally {
+        zenRefreshButton.disabled = false;
+      }
+    });
+
+    zenModelSelect.addEventListener('change', () => {
+      persist({ zenModel: zenModelSelect.value });
+    });
+
+    [baseInput, modelInput, keyInput, zenKeyInput, systemInput, temperatureInput, streamInput, autoFallbackInput].forEach((element) => {
+      if (!element) return;
+      const handler = () => persist(currentConfig());
+      element.addEventListener(element.type === 'checkbox' || element.tagName === 'SELECT' ? 'change' : 'input', handler);
+    });
+
     $('#ai-clear', root).addEventListener('click', () => {
       messages.length = 0;
       log.innerHTML = '';
@@ -2736,9 +3098,16 @@ console.log('CTool');
     });
     sendButton.addEventListener('click', send);
     bindCtrlEnter(input, send);
-    [baseInput, modelInput, keyInput, streamInput].forEach((element) => {
-      if (element) element.addEventListener('input', refreshState);
-    });
+    fillModelOptions();
+    if (provider === 'zen' && config.zenModel) zenModelSelect.value = config.zenModel;
     refreshState();
+
+    /* 右键「问 AI」：文本已经随任务传入，直接提问，不需要复制粘贴 */
+    if (context && context.text && context.action === 'ask') {
+      input.value = context.text;
+      setTimeout(() => {
+        if (root.contains(input)) send();
+      }, 80);
+    }
   };
 })();

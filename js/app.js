@@ -134,6 +134,15 @@
       keywordsEn: 'download image document table media video audio pdf zip scrape batch web resources'
     },
     {
+      id: 'github',
+      name: 'GitHub 加速',
+      icon: 'GH',
+      category: '网页下载',
+      description: 'GitHub 文件下载走实测可用的代理节点生成加速直链；所有结果与 GitHub 站内链接默认新标签页打开，网页访问加速已下线。',
+      keywords: 'github 加速 镜像 代理 下载 release raw blob codeload zip git clone 直链 测速 ghproxy ghfast 图片 图床 新标签页 站内链接 下载加速',
+      keywordsEn: 'github accelerate mirror proxy download release raw blob codeload zip git clone direct link speed test ghproxy ghfast image new tab internal links download acceleration'
+    },
+    {
       id: 'jsoncsv',
       name: 'JSON ↔ CSV',
       icon: '⇄',
@@ -228,9 +237,9 @@
       name: 'AI 问答',
       icon: 'AI',
       category: 'AI 助手',
-      description: '使用 OpenAI 兼容接口进行问答，密钥仅保存在本机。',
-      keywords: 'ai 问答 chat gpt openai 模型 助手',
-      keywordsEn: 'ai chat gpt openai llm assistant model'
+      description: '内置 OpenCode Zen 免费模型，无需配置即可问答；也可切换自定义接口。',
+      keywords: 'ai 问答 chat zen opencode 免费 零配置 模型 助手 大模型',
+      keywordsEn: 'ai chat zen opencode free zero config llm assistant model'
     },
     {
       id: 'xml',
@@ -379,7 +388,8 @@
       pageTitle: task.pageTitle || '',
       sourceTabId: task.sourceTabId
     });
-    showToast(task.text ? '已载入选中文本' : '已打开工具');
+    const fromPage = /^(page-badge|page-chip|link-context-menu)$/.test(task.source || '');
+    showToast(T.t(fromPage ? '已载入页面链接' : (task.text ? '已载入选中文本' : '已打开工具')));
   }
 
   async function applyPendingFromStorage() {
@@ -622,15 +632,6 @@
 
     const close = $('#compact-close');
     if (close) close.addEventListener('click', closeCompactPanel);
-
-    if (IN_IFRAME) {
-      window.addEventListener('message', (event) => {
-        if (event.source !== window.parent) return;
-        const data = event.data;
-        if (!data || typeof data !== 'object') return;
-        if (data.type === 'ctool-apply-task') applyTask(data.task);
-      }, false);
-    }
   }
 
   function navItemHtml(tool, favorite) {
@@ -949,6 +950,24 @@
         selectTool(id);
       }
     });
+
+    /* 页内小窗（mode=compact）与油猴 iframe 都通过父窗口投递任务，
+       因此不能在 bindCompactEvents 里绑定，否则油猴版收不到页面图标传参。 */
+    if (IN_IFRAME) {
+      window.addEventListener('message', (event) => {
+        if (event.source !== window.parent) return;
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === 'ctool-apply-task') applyTask(data.task);
+        if (data.type === 'ctool-scan-result' && Array.isArray(data.links)) {
+          try {
+            window.dispatchEvent(new CustomEvent('ctool:github-scan-result', { detail: data.links }));
+          } catch (_) {
+            // 事件派发失败时忽略，用户仍可手动粘贴。
+          }
+        }
+      }, false);
+    }
   }
 
   function bindStorage() {

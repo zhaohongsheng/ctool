@@ -3,7 +3,7 @@
   "name": "CTool 万能工具箱",
   "short_name": "万能工具箱",
   "version": "1.4.0",
-  "description": "本地运行的万能开发者工具箱：35 个工具、中英文切换、职业推荐工作台、AI 问答、网页悬浮小窗与网页资源下载，所有数据仅在本机处理。",
+  "description": "本地运行的万能开发者工具箱：36 个工具、中英文切换、职业推荐工作台、AI 问答（内置 OpenCode Zen 免费模型与公共备用端点，零配置可用）、网页悬浮小窗、网页资源下载与 GitHub 下载加速（节点实测可用，所有链接与 GitHub 站内链接默认新标签页打开）；除 AI 问答、节点测速与主动发起的加速下载外均离线处理。",
   "minimum_chrome_version": "111",
   "permissions": [
     "storage",
@@ -22,6 +22,7 @@
         "<all_urls>"
       ],
       "js": [
+        "js/page-github.js",
         "content.js"
       ],
       "run_at": "document_idle",
