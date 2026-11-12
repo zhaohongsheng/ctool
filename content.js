@@ -187,6 +187,26 @@
 
   let frameLoaded = false;
   let pendingTask = null;
+  let pendingShot = null;
+
+  /* 后台投递的截图先落到内容脚本，再由父窗口 postMessage 送进 iframe；
+     工具页按 id 去重，因此 runtime 直投与这里转发同时到达也不会重复显示。 */
+  function flushPendingShot() {
+    if (!pendingShot || !frameLoaded) return;
+    const shot = pendingShot;
+    pendingShot = null;
+    try {
+      frame.contentWindow.postMessage({ type: 'ctool-screenshot-result', shot: shot }, '*');
+    } catch (_) {
+      pendingShot = shot;
+    }
+  }
+
+  function deliverShotToFrame(shot) {
+    pendingShot = shot;
+    ensureFrame();
+    if (frameLoaded) flushPendingShot();
+  }
 
   function ensureFrame() {
     if (!frame.getAttribute('src')) frame.setAttribute('src', FRAME_URL);
@@ -244,6 +264,7 @@
   frame.addEventListener('load', () => {
     frameLoaded = true;
     deliverTask();
+    flushPendingShot();
   });
 
   /* 直链交付放回页面上下文，避免 iframe 被跨域导航替换，也便于下载器接管 */
@@ -357,6 +378,195 @@
 
   initGithubScanner();
 
+  /* ---------------- 截图：网页内全局快捷键 ----------------
+     chrome.commands 的 suggested_key 对「已安装扩展后新增的命令」不会自动绑定，
+     Windows 的 Alt+Shift 又会被输入法切换截走。这里在内容脚本里直接监听按键，
+     组合由截图工具页自定义，通过 storage 实时同步，彻底不依赖浏览器快捷键设置。 */
+  const SHOT_HOTKEY_KEY = 'ctoolShotHotkeys';
+  const SHOT_HOTKEY_MODES = ['visible', 'area', 'full'];
+  const SHOT_DEFAULT_HOTKEYS = {
+    visible: { code: 'Digit7', ctrl: true, shift: true, alt: false, meta: false },
+    area: { code: 'Digit8', ctrl: true, shift: true, alt: false, meta: false },
+    full: { code: 'Digit9', ctrl: true, shift: true, alt: false, meta: false }
+  };
+  let shotHotkeys = null;
+
+  function loadShotHotkeys() {
+    try {
+      if (!chrome.storage || !chrome.storage.local) return;
+      chrome.storage.local.get(SHOT_HOTKEY_KEY).then((result) => {
+        shotHotkeys = result && result[SHOT_HOTKEY_KEY] ? result[SHOT_HOTKEY_KEY] : null;
+      }).catch(() => {});
+      if (chrome.storage.onChanged) {
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area === 'local' && changes[SHOT_HOTKEY_KEY]) shotHotkeys = changes[SHOT_HOTKEY_KEY].newValue || null;
+        });
+      }
+    } catch (_) { /* 存储不可用时用默认组合 */ }
+  }
+
+  function shotHotkeyMode(event) {
+    if (!event || event.repeat || event.isComposing) return '';
+    const code = event.code || '';
+    for (let i = 0; i < SHOT_HOTKEY_MODES.length; i += 1) {
+      const mode = SHOT_HOTKEY_MODES[i];
+      const cfg = (shotHotkeys && shotHotkeys[mode]) || SHOT_DEFAULT_HOTKEYS[mode];
+      if (!cfg || cfg.code !== code) continue;
+      if (!!event.ctrlKey !== !!cfg.ctrl || !!event.shiftKey !== !!cfg.shift ||
+          !!event.altKey !== !!cfg.alt || !!event.metaKey !== !!cfg.meta) continue;
+      return mode;
+    }
+    return '';
+  }
+
+  document.addEventListener('keydown', (event) => {
+    const mode = shotHotkeyMode(event);
+    if (!mode) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      chrome.runtime.sendMessage({ type: 'ctool-capture-hotkey', mode: mode });
+    } catch (_) { /* 扩展刚更新时后台可能短暂不可用 */ }
+  }, true);
+  loadShotHotkeys();
+
+  /* ---------------- 截图：框选区域遮罩（只在顶层页面运行） ---------------- */
+  function startAreaSelection() {
+    return new Promise((resolve) => {
+      const SELECT_ID = 'ctool-shot-select-host';
+      const previous = document.getElementById(SELECT_ID);
+      if (previous) previous.remove();
+
+      const host = document.createElement('div');
+      host.id = SELECT_ID;
+      host.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483647;width:100vw;height:100vh;cursor:crosshair;';
+      let shadow = null;
+      try {
+        shadow = host.attachShadow({ mode: 'open' });
+      } catch (_) {
+        resolve({ ok: false, reason: 'unsupported' });
+        return;
+      }
+
+      const style = document.createElement('style');
+      style.textContent = `
+        .mask { position:fixed; inset:0; background:rgba(15,23,42,.34); }
+        .box { position:fixed; display:none; border:2px dashed #6366f1; background:rgba(99,102,241,.16); }
+        .tip { position:fixed; top:16px; left:50%; transform:translateX(-50%); padding:9px 16px; border-radius:999px;
+               background:#0f172a; color:#fff; font:13px/1.5 system-ui,sans-serif; white-space:nowrap;
+               box-shadow:0 8px 24px rgba(2,6,23,.35); }
+        .size { position:fixed; display:none; padding:3px 9px; border-radius:6px; background:#6366f1;
+                color:#fff; font:12px/1.5 monospace; white-space:nowrap; }
+      `;
+      const mask = document.createElement('div');
+      mask.className = 'mask';
+      const box = document.createElement('div');
+      box.className = 'box';
+      const tip = document.createElement('div');
+      tip.className = 'tip';
+      tip.textContent = '拖动选择截图区域 · Esc 取消 / Drag to select · Esc to cancel';
+      const size = document.createElement('div');
+      size.className = 'size';
+      shadow.appendChild(style);
+      shadow.appendChild(mask);
+      shadow.appendChild(box);
+      shadow.appendChild(tip);
+      shadow.appendChild(size);
+      (document.body || document.documentElement).appendChild(host);
+
+      let dragging = false;
+      let startX = 0;
+      let startY = 0;
+      let done = false;
+      let timer = null;
+
+      function rectOf(x1, y1, x2, y2) {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const x = Math.max(0, Math.min(vw, Math.min(x1, x2)));
+        const y = Math.max(0, Math.min(vh, Math.min(y1, y2)));
+        return {
+          x: x,
+          y: y,
+          w: Math.max(0, Math.min(vw - x, Math.abs(x2 - x1))),
+          h: Math.max(0, Math.min(vh - y, Math.abs(y2 - y1))),
+          viewportW: vw,
+          viewportH: vh
+        };
+      }
+
+      function finish(result) {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        document.removeEventListener('mousedown', onDown, true);
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('mouseup', onUp, true);
+        document.removeEventListener('keydown', onKey, true);
+        host.remove();
+        resolve(result);
+      }
+
+      function paint(x2, y2) {
+        const rect = rectOf(startX, startY, x2, y2);
+        box.style.left = rect.x + 'px';
+        box.style.top = rect.y + 'px';
+        box.style.width = rect.w + 'px';
+        box.style.height = rect.h + 'px';
+        size.style.left = rect.x + 'px';
+        size.style.top = Math.max(0, rect.y - 26) + 'px';
+        size.textContent = Math.round(rect.w) + ' × ' + Math.round(rect.h);
+        return rect;
+      }
+
+      function onDown(event) {
+        if (event.button !== 0 || done) return;
+        event.preventDefault();
+        event.stopPropagation();
+        dragging = true;
+        startX = event.clientX;
+        startY = event.clientY;
+        box.style.display = 'block';
+        size.style.display = 'block';
+        paint(startX, startY);
+      }
+
+      function onMove(event) {
+        if (!dragging) return;
+        event.preventDefault();
+        paint(event.clientX, event.clientY);
+      }
+
+      function onUp(event) {
+        if (!dragging) return;
+        event.preventDefault();
+        event.stopPropagation();
+        dragging = false;
+        const rect = rectOf(startX, startY, event.clientX, event.clientY);
+        if (rect.w < 8 || rect.h < 8) {
+          box.style.display = 'none';
+          size.style.display = 'none';
+          return;
+        }
+        finish({ ok: true, rect: rect });
+      }
+
+      function onKey(event) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          finish({ ok: false, reason: 'cancelled' });
+        }
+      }
+
+      document.addEventListener('mousedown', onDown, true);
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('mouseup', onUp, true);
+      document.addEventListener('keydown', onKey, true);
+      timer = setTimeout(() => finish({ ok: false, reason: 'timeout' }), 120000);
+    });
+  }
+
   /* 注入器在无宿主回调时的兜底消息；iframe（工具页）的消息交给下面的监听器，
      避免同一条 ctool-open-new-tab 被处理两次开出两个标签页。 */
   window.addEventListener('message', (event) => {
@@ -435,6 +645,20 @@
 
     if (message.type === 'ctool-panel-state') {
       sendResponse({ ok: true, open: !panel.hidden, loaded: frameLoaded });
+      return false;
+    }
+
+    /* 框选截图：后台等待用户拖框，返回视口 CSS 坐标；裁剪由工具页完成 */
+    if (message.type === 'ctool-start-area-selection') {
+      startAreaSelection().then(sendResponse).catch(() => {
+        sendResponse({ ok: false, reason: 'unsupported' });
+      });
+      return true;
+    }
+
+    if (message.type === 'ctool-screenshot-shot' && message.shot) {
+      deliverShotToFrame(message.shot);
+      sendResponse({ ok: true });
       return false;
     }
 

@@ -867,6 +867,41 @@
     return 'data:' + (mime || 'text/plain') + ';charset=utf-8;base64,' + T.bytesToBase64(bytes);
   }
 
+  /* 页面扫描函数只把表格转成 csv 文本，不会（也不能）生成 URL。
+     这里补上带 UTF-8 BOM 的 data URL，供列表展示 / 复制 / 打包 / 兜底下载共用。
+     BOM 保证 Excel 双击打开中文不乱码。 */
+  function normalizeScannedItems(items) {
+    return (Array.isArray(items) ? items : []).map((item) => {
+      if (item && item.type === 'table' && !item.url) {
+        item.url = textToDataUrl('\ufeff' + String(item.csv == null ? '' : item.csv), 'text/csv');
+      }
+      return item;
+    });
+  }
+
+  /* 表格不是网络资源，没有可下载的 http 链接。
+     优先用同源 Blob（chrome.downloads 对 blob: 支持最稳），失败再回退 data URL；
+     object URL 必须等下载任务建立之后再回收，否则下载会被取消。 */
+  async function downloadResource(item, filename) {
+    if (item && item.type === 'table') {
+      const blob = new Blob(['\ufeff' + String(item.csv == null ? '' : item.csv)], {
+        type: 'text/csv;charset=utf-8'
+      });
+      let objectUrl = '';
+      try {
+        objectUrl = URL.createObjectURL(blob);
+        const id = await downloadUrl(objectUrl, filename);
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+        return id;
+      } catch (error) {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        if (item.url) return downloadUrl(item.url, filename);
+        throw error;
+      }
+    }
+    return downloadUrl(item.url, filename);
+  }
+
   async function downloadUrl(url, filename) {
     if (!chrome.downloads || typeof chrome.downloads.download !== 'function') {
       throw new Error('浏览器下载接口不可用');
@@ -1112,9 +1147,16 @@
           html += '<div class="dl-item-name" title="' + escapeHtml(item.name || item.label || item.url) + '">' + escapeHtml(trimText(item.name || item.label || item.url, 90)) + '</div>';
           html += '<div class="dl-item-meta">';
           if (item.ext) html += '<span class="dl-item-ext">' + item.ext.toUpperCase() + '</span>';
+          else if (isTable) html += '<span class="dl-item-ext">CSV</span>';
           if (item.width && item.height) html += '<span>' + item.width + ' × ' + item.height + '</span>';
           if (item.source) html += '<span>' + escapeHtml(item.source) + '</span>';
-          html += '<span class="dl-url" title="' + escapeHtml(item.url) + '">' + shortUrl(item.url, 60) + '</span>';
+          /* 表格的 url 是完整的 CSV data URL，不能塞进 title（可长达数百 KB），
+             也不该把 base64 展示给用户；改用可被 i18n 规则翻译的行列摘要。 */
+          const urlTitle = isTable ? (item.title || item.name || '') : (item.url || '');
+          const urlLabel = isTable
+            ? (item.rows || 0) + ' 行 × ' + (item.cols || 0) + ' 列'
+            : shortUrl(item.url, 60);
+          html += '<span class="dl-url" title="' + escapeHtml(urlTitle) + '">' + escapeHtml(urlLabel) + '</span>';
           html += '</div>';
           html += '</div>';
           html += '</label>';
@@ -1253,7 +1295,7 @@
         const data = results && results[0] ? results[0].result : null;
         if (!data) throw new Error('页面没有返回有效的扫描结果');
         state.data = data;
-        state.items = Array.isArray(data.items) ? data.items : [];
+        state.items = normalizeScannedItems(data.items);
         state.selected.clear();
         state.activeType = 'all';
         renderItems();
@@ -1297,7 +1339,7 @@
         const item = state.items[index];
         setStatus(statusElement, '正在下载 ' + (offset + 1) + ' / ' + unique.length + '…', 'info');
         try {
-          await downloadUrl(item.url, buildFilename(DEFAULT_FOLDER, item, index));
+          await downloadResource(item, buildFilename(DEFAULT_FOLDER, item, index));
           success += 1;
         } catch (error) {
           failed += 1;
@@ -1323,7 +1365,11 @@
         showToast('请先选择内容', 'warn');
         return;
       }
-      const values = indices.map((index) => state.items[index].url);
+      /* 表格复制 CSV 正文，而不是几百 KB 的 base64 data URL */
+      const values = indices.map((index) => {
+        const item = state.items[index];
+        return item.type === 'table' ? String(item.csv == null ? '' : item.csv) : String(item.url || '');
+      });
       copyText(values.join('\n'));
     }
 
@@ -1426,9 +1472,18 @@
           if (!item) continue;
           setStatus(statusElement, '正在打包 ' + (i + 1) + ' / ' + indices.length + '…', 'info');
           try {
-            const response = await fetch(item.url);
-            if (!response.ok) throw new Error('HTTP ' + response.status);
-            const blob = await response.blob();
+            /* 表格是本地生成的 CSV，直接入包；其余资源才走网络 fetch。
+               一律带 UTF-8 BOM，Excel 打开中文不乱码。 */
+            let blob;
+            if (item.type === 'table') {
+              blob = new Blob(['\ufeff' + String(item.csv == null ? '' : item.csv)], {
+                type: 'text/csv;charset=utf-8'
+              });
+            } else {
+              const response = await fetch(item.url);
+              if (!response.ok) throw new Error('HTTP ' + response.status);
+              blob = await response.blob();
+            }
             let entryName = item.name || ('file-' + (index + 1));
             if (usedNames.has(entryName)) {
               const dot = entryName.lastIndexOf('.');
@@ -1448,13 +1503,17 @@
         }
         const content = await zip.generateAsync({ type: 'blob' });
         const url = URL.createObjectURL(content);
-        chrome.downloads.download({
-          url: url,
-          filename: 'ctool-downloads.zip',
-          conflictAction: 'uniquify',
-          saveAs: false
-        });
-        URL.revokeObjectURL(url);
+        /* 必须等下载任务建立后再回收；此前同步 revoke 会让 ZIP 下载被取消 */
+        try {
+          await chrome.downloads.download({
+            url: url,
+            filename: 'ctool-downloads.zip',
+            conflictAction: 'uniquify',
+            saveAs: false
+          });
+        } finally {
+          setTimeout(() => URL.revokeObjectURL(url), 30000);
+        }
         if (failed) {
           setStatus(statusElement, '已打包 ' + success + ' 项，' + failed + ' 项失败', 'warn');
           showToast('有 ' + failed + ' 项打包失败', 'warn');

@@ -3,7 +3,7 @@
   "name": "CTool 万能工具箱",
   "short_name": "万能工具箱",
   "version": "1.4.0",
-  "description": "本地运行的万能开发者工具箱：36 个工具、中英文切换、职业推荐工作台、AI 问答（内置 OpenCode Zen 免费模型与公共备用端点，零配置可用）、网页悬浮小窗、网页资源下载与 GitHub 下载加速（节点实测可用，所有链接与 GitHub 站内链接默认新标签页打开）；除 AI 问答、节点测速与主动发起的加速下载外均离线处理。",
+  "description": "本地运行的万能开发者工具箱：37 个工具、中英文切换、职业推荐工作台、AI 问答（内置 OpenCode Zen 免费模型与公共备用端点，零配置可用）、网页悬浮小窗、可自定义全局快捷键截图（可见区域 / 框选 / 整页长图，截图时隐藏工具界面与指定元素）、网页资源下载与 GitHub 下载加速；除 AI 问答、节点测速与主动发起的加速下载外均离线处理。",
   "minimum_chrome_version": "111",
   "permissions": [
     "storage",
@@ -64,6 +64,24 @@
         "default": "Ctrl+Shift+Y"
       },
       "description": "打开万能工具箱"
+    },
+    "ctool-shot-visible": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+7"
+      },
+      "description": "截图：当前可见区域"
+    },
+    "ctool-shot-area": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+8"
+      },
+      "description": "截图：框选区域"
+    },
+    "ctool-shot-full": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+9"
+      },
+      "description": "截图：整页长图"
     }
   }
 }

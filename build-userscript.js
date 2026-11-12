@@ -115,7 +115,9 @@ const BOOTSTRAP = String.raw`
     });
   } catch (e) {}
 
-  /* 4) iframe 内也能用快捷键收起工具箱（不占用 Esc，避免与赞赏弹窗冲突） */
+  /* 4) iframe 内也能用快捷键收起工具箱（不占用 Esc，避免与赞赏弹窗冲突）。
+        截图快捷键只由宿主页面处理：getDisplayMedia 需要宿主上下文的用户激活，
+        iframe 里 postMessage 异步转发会丢失激活，必然失败。 */
   document.addEventListener('keydown', function (e) {
     if (e.altKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
       e.preventDefault();
@@ -189,7 +191,7 @@ const DOWNLOAD_OVERRIDE = String.raw`
               'This tool needs Chrome extension APIs and is unavailable in the userscript build.' +
             '</div>' +
             '<div class="field-hint" data-no-i18n>' +
-              '其余 35 个工具均可正常使用；如需网页资源批量下载，请安装完整版 Chrome / Edge 扩展。' +
+              '其余 36 个工具均可正常使用；如需网页资源批量下载，请安装完整版 Chrome / Edge 扩展。' +
             '</div>' +
           '</div>' +
         '</section>' +
@@ -245,6 +247,8 @@ function userscriptMain() {
   const scanner = window.CToolPageGithub || null;
   const aiXhr = new Map();
   let pendingTask = null;
+  let pendingShot = null;
+  let capturing = false;
   let frameReady = false;
 
   let prefs = {};
@@ -343,6 +347,93 @@ function userscriptMain() {
       frame.contentWindow.postMessage({ type: 'ctool-apply-task', task: task }, '*');
     } catch (e) {
       pendingTask = task;
+    }
+  }
+
+  /* 截图结果先排队，等 iframe 加载完成再投递，避免快捷键触发时工具箱还没就绪 */
+  function deliverShot() {
+    if (!pendingShot || !frameReady || !frame || !frame.contentWindow) return;
+    const shot = pendingShot;
+    pendingShot = null;
+    try {
+      frame.contentWindow.postMessage({ type: 'ctool-screenshot-result', shot: shot }, '*');
+    } catch (e) {
+      pendingShot = shot;
+    }
+  }
+
+  function shotError(message) {
+    try {
+      if (frame && frame.contentWindow) {
+        frame.contentWindow.postMessage({ type: 'ctool-screenshot-error', message: message }, '*');
+      }
+    } catch (e) {}
+  }
+
+  /* 截图时隐藏 CTool 自身 UI，避免圆形按钮 / 工具箱窗口被拍进画面。
+     用 visibility 而非 display，不改变页面布局；抓帧结束必定恢复。 */
+  function setSelfVisible(visible) {
+    try { if (launcher) launcher.style.visibility = visible ? '' : 'hidden'; } catch (e) {}
+    try { if (overlay) overlay.style.visibility = visible ? '' : 'hidden'; } catch (e) {}
+    /* GitHub 页面注入的 ⚡ / ↓ 图标与右下角批量胶囊同样属于工具自身 UI */
+    try {
+      var hosts = document.querySelectorAll('span.ctool-gh-host');
+      for (var i = 0; i < hosts.length; i += 1) hosts[i].style.visibility = visible ? '' : 'hidden';
+    } catch (e) {}
+  }
+
+  /* 油猴环境没有 captureVisibleTab：让用户选择要共享的标签页 / 窗口后抓取一帧。
+     快捷键在顶层页面按下时具备用户激活，getDisplayMedia 才能正常弹出授权框。 */
+  async function captureDisplay() {
+    if (capturing) return;
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+      shotError('当前浏览器不支持屏幕捕获；请使用完整版扩展');
+      return;
+    }
+    capturing = true;
+    let stream = null;
+    setSelfVisible(false);
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 1 }, audio: false });
+      const video = document.createElement('video');
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      video.autoplay = true;
+      try { await video.play(); } catch (e) { /* 部分浏览器在 loadeddata 前拒绝 play */ }
+      await new Promise(function (resolve) {
+        if (video.readyState >= 2) { resolve(); return; }
+        video.addEventListener('loadeddata', resolve, { once: true });
+        setTimeout(resolve, 1500);
+      });
+      const width = video.videoWidth || window.innerWidth;
+      const height = video.videoHeight || window.innerHeight;
+      if (!width || !height) throw new Error('未获取到画面尺寸');
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext('2d').drawImage(video, 0, 0, width, height);
+      const shot = {
+        id: 'us-' + Date.now() + '-' + Math.random().toString(16).slice(2),
+        mode: 'visible',
+        dataUrl: canvas.toDataURL('image/png'),
+        sourceUrl: location.href,
+        createdAt: Date.now(),
+        viewportW: width,
+        viewportH: height
+      };
+      pendingShot = shot;
+      open({ tool: 'screenshot', source: 'screenshot' });
+      deliverShot();
+    } catch (e) {
+      const cancelled = e && (e.name === 'NotAllowedError' || e.name === 'AbortError');
+      shotError(cancelled ? '已取消屏幕共享' : ('截图失败：' + (e && e.message ? e.message : String(e))));
+    } finally {
+      if (stream) {
+        try { stream.getTracks().forEach(function (track) { track.stop(); }); } catch (e) {}
+      }
+      setSelfVisible(true);
+      capturing = false;
     }
   }
 
@@ -465,6 +556,7 @@ function userscriptMain() {
     frame.addEventListener('load', function () {
       frameReady = true;
       deliverTask();
+      deliverShot();
       setTimeout(function () {
         try {
           if (frame.contentWindow && frame.contentWindow.CTool &&
@@ -517,6 +609,7 @@ function userscriptMain() {
     overlay.style.display = 'block';
     launcher.style.transform = 'scale(0.92)';
     deliverTask();
+    deliverShot();
   }
   function close() {
     if (overlay) overlay.style.display = 'none';
@@ -595,6 +688,14 @@ function userscriptMain() {
       }
       return;
     }
+    if (d.type === 'ctool-capture-request') {
+      if (d.mode && d.mode !== 'visible') {
+        shotError('框选与整页长截图需要完整版扩展；油猴版请在页面主体按 Ctrl+Shift+7');
+      } else {
+        captureDisplay();
+      }
+      return;
+    }
     if (d.type === 'ctool-ai-fetch') { aiFetch(d, event.source); return; }
     if (d.type === 'ctool-ai-abort') {
       const handle = aiXhr.get(d.id);
@@ -618,11 +719,31 @@ function userscriptMain() {
     }
   });
 
+  /* 油猴版截图快捷键：读截图工具页保存的自定义组合，默认 Ctrl+Shift+7
+     （Alt+Shift 在 Windows 上会被输入法切换截走）。
+     需在页面主体按下，getDisplayMedia 才具备用户激活。 */
+  function readShotHotkey() {
+    try {
+      const raw = prefs['ctoolShotHotkeys'];
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && parsed.visible && parsed.visible.code) return parsed.visible;
+    } catch (err) {}
+    return { code: 'Digit7', ctrl: true, shift: true, alt: false, meta: false };
+  }
+
   document.addEventListener('keydown', function (e) {
     if (e.altKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
       e.preventDefault();
       toggle();
+      return;
     }
+    if (e.repeat || e.isComposing) return;
+    const hk = readShotHotkey();
+    if ((e.code || '') !== hk.code) return;
+    if (!!e.ctrlKey !== !!hk.ctrl || !!e.shiftKey !== !!hk.shift ||
+        !!e.altKey !== !!hk.alt || !!e.metaKey !== !!hk.meta) return;
+    e.preventDefault();
+    captureDisplay();
   }, true);
 
   installLauncher();
@@ -654,7 +775,7 @@ const header = [
   '// @name:en      CTool Toolkit (Userscript)',
   '// @namespace    ctool-userscript',
   '// @version      ' + VERSION,
-  '// @description  36 个本地开发者工具，AI 问答内置 OpenCode Zen 免配置可用；GitHub 下载走实测可用的代理节点，所有 GitHub 链接与站内链接默认新标签页打开；悬浮按钮 / 菜单 / Alt+Shift+C 打开，默认不主动联网。',
+  '// @description  37 个本地开发者工具，AI 问答内置 OpenCode Zen 免配置可用；Ctrl+Shift+7 截图（浏览器授权后抓帧，自动隐藏工具界面）、Alt+Shift+C 打开工具箱；GitHub 下载走实测可用的代理节点，所有 GitHub 链接与站内链接默认新标签页打开，默认不主动联网。',
   '// @author       CTool',
   '// @license      Bundled vendors: jsQR Apache-2.0, JSZip MIT/GPLv3, qrcode MIT',
   '// @match        *://*/*',
@@ -673,6 +794,7 @@ const header = [
  ' * 内联：toolbox.html + css/style.css + ' + scriptSrcs.length + ' 个 JS + 2 张赞赏码（Base64）。',
  ' * 宿主侧另内联 js/page-github.js（下载图标走文件代理；网页访问加速已下线，GitHub 站内链接统一新标签页打开；图片加速单独分流）。',
  ' * AI 问答通过 GM_xmlhttpRequest 桥发请求以绕开 iframe 的 CORS 限制；网页资源下载工具在非扩展环境下显示不可用提示。',
+ ' * 截图工具在油猴版通过宿主 getDisplayMedia 抓取一帧（默认 Ctrl+Shift+7，可自定义），抓帧前隐藏自身 UI；框选与整页长图仅完整版扩展支持。',
  ' * 零外部依赖、默认不主动发起网络请求（AI 问答与 GitHub 测速由用户触发）。',
   ' */',
   ''

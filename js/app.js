@@ -143,6 +143,15 @@
       keywordsEn: 'github accelerate mirror proxy download release raw blob codeload zip git clone direct link speed test ghproxy ghfast image new tab internal links download acceleration'
     },
     {
+      id: 'screenshot',
+      name: '截图工具',
+      icon: '▣',
+      category: '网页下载',
+      description: 'Ctrl+Shift+7 / 8 / 9 全局快捷键截图（可自定义）：可见区域、框选区域与整页长图；截图时隐藏工具界面与指定元素，支持 PNG / JPG 保存与复制到剪贴板。',
+      keywords: '截图 截屏 快捷键 自定义按键 屏幕捕获 可见区域 框选 区域 长图 整页 滚动截图 隐藏元素 隐藏工具 png jpg 剪贴板 保存 hotkey screenshot capture hide',
+      keywordsEn: 'screenshot capture hotkey shortcut rebind visible area region select full page scrolling stitch hide element hide ui png jpeg clipboard save snip'
+    },
+    {
       id: 'jsoncsv',
       name: 'JSON ↔ CSV',
       icon: '⇄',

@@ -2,11 +2,11 @@
 
 # CTool — All-in-One Toolbox
 
-A Chrome extension (Manifest V3) that runs locally in your browser. No account and no setup: AI chat ships with free OpenCode Zen models and works out of the box. Apart from AI chat, GitHub mirror speed tests and mirror visits you start yourself, no network access is required — every input, conversion and generated result stays on your device. Using an accelerated link or visiting a mirrored page does hand the URL to a third-party mirror; see "GitHub mirror acceleration".
+A Chrome extension (Manifest V3) that runs locally in your browser. No account and no setup: AI chat ships with free OpenCode Zen models and works out of the box, and `Ctrl+Shift+7/8/9` global shortcuts (all rebindable) capture screenshots. Apart from AI chat and GitHub node speed tests, no network access is required — every input, conversion, screenshot and generated result stays on your device. Using an accelerated link does hand the URL to a third-party proxy node; see "GitHub mirror acceleration".
 
 ## Features
 
-36 tools organized by category, with search, Simplified Chinese / English switching, and dark / light themes:
+37 tools organized by category, with search, Simplified Chinese / English switching, and dark / light themes:
 
 | Category | Tool | Description |
 | --- | --- | --- |
@@ -40,6 +40,7 @@ A Chrome extension (Manifest V3) that runs locally in your browser. No account a
 | Convert | Date calculator | Compute the difference between dates, or add / subtract days |
 | Web download | Web download | Scan a page for images, documents, tables and media; group by type, tick checkboxes and batch-download |
 | Web download | GitHub accelerator | Paste a URL to build accelerated download links with retested proxy nodes; every result and GitHub internal link opens in a new tab. Node retesting, speed tests, git clone acceleration and page icons are included; page visit acceleration has been removed |
+| Web download | Screenshot | `Ctrl+Shift+7` captures the visible area, `Ctrl+Shift+8` selects a region, `Ctrl+Shift+9` stitches a scrolling full-page shot; shortcuts are rebindable, and the tool hides its own UI plus chosen elements before capture; export PNG / JPG, copy to clipboard and keep the last 6 shots |
 | Content & office | Markdown preview | Render Markdown locally; export HTML and `.md` files |
 | Content & office | QR code generator | Generate PNG / SVG QR codes and read QR codes from images |
 | Content & office | Image compressor | Compress, resize and convert image formats locally in the browser |
@@ -70,8 +71,8 @@ A Chrome extension (Manifest V3) that runs locally in your browser. No account a
 - Open the full toolbox with the toolbar icon or `Ctrl+Shift+Y`.
 - Reopening focuses the existing toolbox tab instead of creating a duplicate.
 - A floating CTool icon sits in the bottom-right corner of every ordinary web page; click it to open a compact window inside that page without leaving it.
-- The compact window and the full toolbox share the same `toolbox.html`: the top dropdown lists all 36 tools and runs the selected one inline.
-- Select text on a page, then right-click → **Process with CTool** to load it into the in-page compact window and run the action automatically. The selection menu has 20 entries covering encoding / decoding, formatting, hashing, QR codes, URLs, JWTs and GitHub link acceleration. Right-clicking a GitHub link adds 3 more entries ("⚡ Accelerate this link with CTool" / "⚡ CTool one-click accelerated download" / "🌐 Open this link through a mirror") that pass the URL into the tool or open the mirrored page directly.
+- The compact window and the full toolbox share the same `toolbox.html`: the top dropdown lists all 37 tools and runs the selected one inline.
+- Select text on a page, then right-click → **Process with CTool** to load it into the in-page compact window and run the action automatically. The selection menu has 20 entries covering encoding / decoding, formatting, hashing, QR codes, URLs, JWTs and GitHub link acceleration. Right-clicking a GitHub link adds 2 more entries ("⚡ Accelerate this link with CTool" / "⚡ CTool one-click accelerated download") that pass the URL straight into the tool.
 - The compact window can be expanded into the full toolbox at any time, carrying the current tool and input along.
 - The sidebar supports multi-keyword search (press `/` to focus the search box).
 - Each tool has a `#tool-id` hash URL, so it can be bookmarked or restored after a reload.
@@ -137,12 +138,13 @@ Requires Chrome / Edge 111 or newer (the UI uses `color-mix()`).
 - **Floating compact window**:
   1. Find the CTool icon in the bottom-right corner of any ordinary web page;
   2. Click it to open the in-page compact window;
-  3. Pick any of the 36 tools from the toolbar on the left and use it directly;
+  3. Pick any of the 37 tools from the toolbar on the left and use it directly;
   4. Click the expand button in the top-right to switch to the full toolbox, or the close button / `Esc` to collapse the compact window.
 - **Switch language**: use the dropdown in the bottom-left corner to choose "简体中文" or "English"; the setting persists across reloads.
 - **Workspace & favorites**: open "Workspace" in the sidebar, pick a profession to see recommended tools; click the star next to any tool to favorite it, and it will appear in the "My favorites" group.
 - **AI chat**: open "AI assistant → AI chat" and just ask — free OpenCode Zen models are the default and need no configuration. To use your own service, switch to "Custom endpoint", enter the base URL, model and API key (leave it empty for local Ollama); settings save automatically and streaming is supported. You can also right-click a text selection and choose "💬 Ask AI (zero config)".
 - **GitHub acceleration**: open "Web download → GitHub accelerator", paste a URL and click "⚡ One-click accelerate" — download links appear on the Results tab, ready to copy, open or download. Nodes and toggles live under "Settings & help"; use "Speed test" to sort by latency. Every "Open" button, page icon, context-menu action and GitHub internal-link click uses a new tab and never replaces the current page. Faster still: click the ⚡ / ↓ icon next to a GitHub download link, use the CTool right-click menu, or click "Scan page" to pull every link from the source tab at once. Page visit acceleration has been removed.
+- **Screenshot**: on any page press `Ctrl+Shift+7` for the visible area, `Ctrl+Shift+8` to drag a region, or `Ctrl+Shift+9` to stitch a full-page shot. Results appear under "Web download → Screenshot". CTool listens for the keys directly on the page, so it does not depend on browser shortcut bindings; click a key button to rebind or restore defaults. "Hide before capture" temporarily hides the CTool floating button, compact window, page icons, fixed / sticky elements and custom CSS selectors using visibility (layout stays intact), then restores everything. PNG / JPG, clipboard copy, the last 6 shots and auto-save are all included.
 - **Process selected text from the context menu**:
   1. Select text on any web page;
   2. Right-click → **Process with CTool**;
@@ -170,7 +172,7 @@ Requires Chrome / Edge 111 or newer (the UI uses `color-mix()`).
 | `clipboardWrite` | Copy conversion results, resource links or CSV to the clipboard |
 | `scripting` | Read images, links, tables and media in the page you choose, and re-inject the floating entry point after extension updates |
 | `downloads` | Batch-download page resources into categorized folders |
-| `<all_urls>` | Show the floating icon and compact window on ordinary pages, scan the page you select, send GitHub proxy HEAD probes and open links in new tabs; page icons are injected only on GitHub domains; no pages are read automatically in the background |
+| `<all_urls>` | Show the floating icon and compact window on ordinary pages, scan the page you select, capture the active tab's visible area via `captureVisibleTab`, send GitHub proxy HEAD probes and open links in new tabs; page icons are injected only on GitHub domains; no pages are read automatically in the background |
 
 - Page icons are injected by `js/page-github.js` on GitHub domains only. It reads `a[href]` values, leaves links untouched, reads no page text and makes no network requests; toggles are stored locally in `ctool.githubPageBadges` / `ctool.githubNewTabLinks` / `ctool.githubImageBoost` (mirrored to `ctoolGithubBadges` / `ctoolGithubNewTabLinks` / `ctoolGithubImageBoost` in the extension).
 - Page visit acceleration is gone, so no third-party website mirror is contacted. Only "Speed test" and image acceleration reach a file proxy node. The image proxy prefix is stored in `ctoolGithubImageNode`; legacy preferences `ctool.githubVisitNode` / `ctoolGithubVisitNode` and `ctool.githubAutoVisit` are cleared so no domain swapping survives an upgrade.
@@ -180,6 +182,7 @@ Requires Chrome / Edge 111 or newer (the UI uses `color-mix()`).
 - The sponsor reminder's shown / dismissed state is written only to local `localStorage` and is never uploaded.
 - QR decoding reads pixels on a local canvas (jsQR 1.4.0, Apache-2.0; see `js/vendor-jsqr-LICENSE.txt`). Images are never uploaded.
 - While scanning a page, the extracted resource list is processed only in the toolbox page's memory and is never sent to a server.
+- Screenshots are produced locally by the browser (`chrome.tabs.captureVisibleTab`); region cropping, full-page stitching and PNG / JPG conversion all happen on a canvas in the tool page. Raw frames live only in a background memory queue — never written to disk or uploaded. Protected pages (chrome://, extension stores) cannot be captured, and full-page capture restores the original scroll position. Temporary hiding only touches the in-memory DOM: no page file is modified and no selector is uploaded.
 - Text passed in from the context menu is handed to the current tab's compact window via in-page `postMessage`; only when falling back to a standalone window is it briefly passed through `chrome.storage.local`, and deleted immediately after being read.
 - The floating icon only opens the compact window and never reads page content on its own. Page resources are read only when you choose the Web download tool inside the compact window and click Scan.
 - Downloads are handled by the browser's download manager; the extension never sends file contents to third parties.
@@ -191,9 +194,14 @@ Requires Chrome / Edge 111 or newer (the UI uses `color-mix()`).
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Shift+Y` | Open / focus the toolbox |
+| `Ctrl+Shift+7` | Capture the visible area of the active tab; the shot appears in Screenshot |
+| `Ctrl+Shift+8` | Drag a box on the page to capture a region (Esc cancels) |
+| `Ctrl+Shift+9` | Scroll and stitch a full-page shot (up to 10 screens) |
 | `/` | Focus the tool search box |
 | `Esc` | Clear search / close the mobile sidebar; collapse the in-page compact window |
 | `Ctrl+Enter` | Run a conversion in most text tools |
+
+Rebind capture shortcuts by clicking the key buttons under "Web download → Screenshot → Shortcuts & settings" (browser-level fallbacks can also be changed at `chrome://extensions/shortcuts`). `Alt+Shift` is avoided by default because Windows reserves it for switching input languages, which makes shortcuts appear broken. The UserScript build only offers `Ctrl+Shift+7` (the browser asks what to share, then one frame is grabbed), and it must be pressed on the page itself rather than inside the toolbox iframe.
 
 ## Project structure
 
@@ -227,6 +235,7 @@ ctool/
 │   ├── tools-extra.js              # JSON/CSV, Cron, URL, Diff, AES, Markdown, QR codes, ...
 │   ├── tools-more.js               # XML, SQL, Unicode, file hash, image Base64, HTTP reference, ...
 │   ├── tools-download.js           # Scan and download page images, documents, tables and media
+│   ├── tools-screenshot.js         # Capture shortcuts, region cropping, full-page stitching, hide before capture, image export
 │   ├── page-github.js              # GitHub page link detection, icon injection and one-click task passing
 │   ├── tools-github.js             # GitHub URL parsing, mirror links, node management and speed tests
 │   ├── tools-workspace.js          # Workspace, profession recommendations and one-click workflows
@@ -253,17 +262,18 @@ Some platforms accept only a `.js` upload and cannot take an extension package. 
 node build-userscript.js
 ```
 
-The output `ctool.user.js` (~1.3 MB) inlines `toolbox.html`, `css/style.css`, all 17 scripts and both QR code images (converted to Data URLs using file magic bytes). It has zero external dependencies and makes no automatic network requests, so it can be installed directly in Tampermonkey / Violentmonkey or uploaded to a platform that only accepts `.js`. Re-run the command after any source change to refresh the output; **do not edit the generated file directly**.
+The output `ctool.user.js` (~1.4 MB) inlines `toolbox.html`, `css/style.css`, all 18 scripts and both QR code images (converted to Data URLs using file magic bytes). It has zero external dependencies and makes no automatic network requests, so it can be installed directly in Tampermonkey / Violentmonkey or uploaded to a platform that only accepts `.js`. Re-run the command after any source change to refresh the output; **do not edit the generated file directly**.
 
-Usage: the round **C** button in the page's bottom-right corner, the "Open / close CTool toolbox" menu command, or `Alt+Shift+C`. The toolbox runs in an isolated iframe so it does not pollute host page styles; preferences (theme, language, favorites, dismissed sponsor reminder) are saved across sites via `GM_getValue` / `GM_setValue`.
+Usage: the round **C** button in the page's bottom-right corner, the "Open / close CTool toolbox" menu command, or `Alt+Shift+C`; press `Ctrl+Shift+7` to grant screen sharing, grab one frame and open the Screenshot tool (its own UI is hidden before the grab). The toolbox runs in an isolated iframe so it does not pollute host page styles; preferences (theme, language, favorites, dismissed sponsor reminder) are saved across sites via `GM_getValue` / `GM_setValue`.
 
-The host-page side also inlines `js/page-github.js`: the ⚡ / ↓ / 🌐 icons, the bottom-right batch chip, one-click task passing, automatic downloads, mirrored page visits and image acceleration all work in the userscript build. Scanning, downloads and new tabs happen in the page context, so a strict site CSP may block them; use the full extension on such sites.
+The host-page side also inlines `js/page-github.js`: the ⚡ / ↓ icons, bottom-right batch chip, one-click task passing, new-tab handling for internal links and image acceleration all work in the userscript build; page visit acceleration has been removed. Scanning, downloads and new tabs happen in the page context, so a strict site CSP may block them; use the full extension on such sites.
 
 Differences from the extension build:
 
 | Capability | UserScript build |
 | --- | --- |
-| 36 tools | All available except "Web download", which shows an unavailable notice (it depends on the `tabs` / `scripting` / `downloads` extension APIs, so ZIP packing is unavailable too) |
+| 37 tools | All available except "Web download", which shows an unavailable notice (it depends on the `tabs` / `scripting` / `downloads` extension APIs, so ZIP packing is unavailable too) |
+| Screenshot | Only `Ctrl+Shift+7` visible-area capture works (the browser asks which tab / window to share, and hides its own UI first); region selection and full-page stitching need `captureVisibleTab` and the full extension, so those buttons are disabled with an explanation |
 | Floating compact window, context menu | Replaced by the floating button, menu command and keyboard shortcut |
 | AI chat | Available by default: requests to OpenCode Zen go through the `GM_xmlhttpRequest` bridge to bypass iframe CORS; full responses (non-streaming), custom endpoints use the same channel |
 | GitHub accelerator | Link generation, derived URLs, clone commands, page icons, one-click task passing, new-tab handling for internal links and image acceleration all work; page visit acceleration has been removed; speed tests inside the iframe are limited by page CORS / CSP and only give a rough reachability signal — prefer the full extension |
@@ -279,3 +289,4 @@ The iframe uses inline scripts via `srcdoc`. If a target site sets a strict `Con
 - The download tool can only reach resources visible or accessible in the browser page: DRM-protected video, temporary URLs requiring authentication, unrendered virtual-scroll lists, tables embedded as text inside images, `chrome://` pages and some hotlink-protected resources may not be directly downloadable.
 - m3u8 / mpd downloads fetch the streaming manifest itself, not a merged video; use a dedicated stream downloader if you need the full video.
 - Scan results are a snapshot of the page's current state; click "Scan page" again after the page dynamically loads more content.
+- Captures are limited by the browser: protected pages such as `chrome://` cannot be captured, and full-page shots temporarily scroll the page so sticky headers may repeat; stitching is capped at 10 screens / 24,000 px. Full-page capture tolerates individual frame failures, uses instant scrolling to avoid smooth-scroll misalignment, sizes the canvas from real frame positions, and reports a clear error when the browser canvas limit is hit.
